@@ -1,0 +1,15 @@
+# Base image with GPU support 
+#FROM pytorch/pytorch:2.5.1-cuda11.8-cudnn9-runtime
+
+FROM python:3.9
+
+# Set working directory
+WORKDIR /app
+COPY . .
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+
+
+CMD ["python", "./confidence_localization/modeling/train.py"]
