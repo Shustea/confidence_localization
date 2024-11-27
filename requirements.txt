@@ -4,3 +4,11 @@ isort
 pip
 python-dotenv
 -e .
+
+numpy==1.23.5
+torch==2.0.1
+torchvision==0.15.2
+scikit-learn==1.3.0
+matplotlib==3.7.2
+pandas==2.0.3
+pytorch-lighting==2.4.0
