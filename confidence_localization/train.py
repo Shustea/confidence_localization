@@ -1,9 +1,11 @@
 import pytorch_lightning as pl
 import torch
+from numpy import arange
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchmetrics.classification import Accuracy
+from pytorch_lightning.loggers import TensorBoardLogger
 
 class CIFAR10Classifier(pl.LightningModule):
     def __init__(self):
@@ -17,7 +19,7 @@ class CIFAR10Classifier(pl.LightningModule):
         self.fc2 = nn.Linear(512, 10)  # 10 classes in CIFAR-10
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=1)
-        self.accuracy = Accuracy(num_classes=10)
+        self.accuracy = Accuracy(num_classes=10, task='multiclass')
 
     def forward(self, x):
         x = self.relu(self.conv1(x))
@@ -32,6 +34,7 @@ class CIFAR10Classifier(pl.LightningModule):
         images, labels = batch
         outputs = self(images)
         loss = nn.CrossEntropyLoss()(outputs, labels)
+        self.log("train_loss", loss, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -39,12 +42,11 @@ class CIFAR10Classifier(pl.LightningModule):
         outputs = self(images)
         val_loss = nn.CrossEntropyLoss()(outputs, labels)
         acc = self.accuracy(outputs, labels)
-        return {"val_loss": val_loss, "val_acc": acc}
+        
+        self.log("validation_loss", val_loss, on_step=True, on_epoch=True)
+        self.log("validation_accuracy", acc, on_step=True, on_epoch=True)
 
-    def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        avg_acc = torch.stack([x["val_acc"] for x in outputs]).mean()
-        return {"val_loss": avg_loss, "val_acc": avg_acc}
+        return {"val_loss": val_loss, "val_acc": acc}
 
     def configure_optimizers(self):
         # Use Adam optimizer
@@ -63,11 +65,20 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
+    # Declare Logger
+    logger = TensorBoardLogger("tb_logs", name="VAE test")
+
     # Initialize the model
     model = CIFAR10Classifier()
 
+
     # Setup Trainer
-    trainer = pl.Trainer(max_epochs=10, gpus=1 if torch.cuda.is_available() else 0)
+    trainer = pl.Trainer(
+        logger=logger,
+        max_epochs=5,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",  
+        devices=1 if torch.cuda.is_available() else 0 
+    )
 
     # Train the model
     trainer.fit(model, train_loader, val_loader)
