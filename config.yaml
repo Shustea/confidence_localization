@@ -1,0 +1,35 @@
+train_path: "/workspaces/confidence_localization/data/processed/train/"
+val_path: "/workspaces/confidence_localization/data/processed/validation/"
+test_path: "/workspaces/confidence_localization/data/processed/test/"
+target_path: "/workspaces/confidence_localization/data/processed/target/"
+wav_path: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
+
+batch_size: 2
+
+delete_all_samples_flag: False
+sample_length_secs: 5
+room_dim: [3, 3, 3]
+receivers_coords:
+  - [1.5, 1.5, 1.5]
+  - [1.4, 1.641, 1.5]
+  - [1.45, 1.55, 1.5]
+  - [1.55, 1.55, 1.5]
+sound_velocity: 340
+reverberation_time: 0.16
+nsample: 4096
+p_silence: 0.0
+p_one: 0.6
+
+recivers_num : 4
+
+fs: 16000
+win_len : 512
+overlap : 0.75
+
+eps: 1e-6
+
+input_dim : 257
+hidden_dim : 2048
+num_layers : 3
+
+gevd : False

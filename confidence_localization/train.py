@@ -2,83 +2,87 @@ import pytorch_lightning as pl
 import torch
 from numpy import arange
 from torch import nn
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
-from torchmetrics.classification import Accuracy
+import torch.nn.functional as F
 from pytorch_lightning.loggers import TensorBoardLogger
+from model import Mamba
+from torchvision import transforms
 
-class CIFAR10Classifier(pl.LightningModule):
-    def __init__(self):
-        super(CIFAR10Classifier, self).__init__()
-        # Define a simple CNN architecture
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.fc1 = nn.Linear(128 * 8 * 8, 512)
-        self.fc2 = nn.Linear(512, 10)  # 10 classes in CIFAR-10
-        self.relu = nn.ReLU()
-        self.softmax = nn.Softmax(dim=1)
-        self.accuracy = Accuracy(num_classes=10, task='multiclass')
+import hydra
+
+import os
+import sys
+sys.path.append(os.getcwd() + '/data')
+
+import confidence_localization_dataloader as cld
+
+class DOAMAMBA(pl.LightningModule):
+    def __init__(self, cfg):
+        super(DOAMAMBA, self).__init__()
+        self.cfg = cfg
+        self.mamba = Mamba(cfg.input_dim, cfg.hidden_dim, cfg.num_layers, cfg.recivers_num)
+        self.channel_conv = nn.Conv2d(2*(cfg.recivers_num - 1), 1, 2*(cfg.recivers_num - 1)-1, padding=2)
+        self.doa = nn.Linear(cfg.hidden_dim, cfg.input_dim)
+        self.logvar = nn.Linear(cfg.hidden_dim, cfg.input_dim)
+        self.batch_norm = nn.BatchNorm2d(2*(cfg.recivers_num - 1))
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.pool(self.relu(self.conv2(x)))
-        x = self.pool(self.relu(self.conv3(x)))
-        x = torch.flatten(x, 1)
-        x = self.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+        # feature extraction
+        embeded_space = F.selu(self.channel_conv(F.tanh(self.mamba(x))).squeeze(1))
+        return (self.doa(embeded_space), self.logvar(embeded_space))
 
     def training_step(self, batch, batch_idx):
-        images, labels = batch
-        outputs = self(images)
-        loss = nn.CrossEntropyLoss()(outputs, labels)
-        self.log("train_loss", loss, on_step=True, on_epoch=True)
-        return loss
+
+        loss_func = nn.MSELoss()
+        spectrum, labels = batch
+        spectrum = self.batch_norm(spectrum.float())
+        doa, logvar = self(spectrum)
+        #about loss - maybe the logvar should be more aggresive?
+        train_loss = ((1/logvar.exp()) * torch.sqrt(loss_func(doa[~labels.isnan()], labels[~labels.isnan()])) + logvar).mean()
+        self.log("train_loss", train_loss, on_step=True, on_epoch=True)
+        return train_loss.to(dtype=torch.float32)
 
     def validation_step(self, batch, batch_idx):
-        images, labels = batch
-        outputs = self(images)
-        val_loss = nn.CrossEntropyLoss()(outputs, labels)
-        acc = self.accuracy(outputs, labels)
+        loss_func = nn.MSELoss()
+        spectrum, labels = batch
+        spectrum = self.batch_norm(spectrum.float())
+        doa, logvar = self(spectrum)
+        val_loss = ((1/logvar.exp()) * torch.sqrt(loss_func(doa[~labels.isnan()], labels[~labels.isnan()])) + logvar).mean()
+        acc = self.accuracy(doa, labels, logvar.exp())
         
         self.log("validation_loss", val_loss, on_step=True, on_epoch=True)
         self.log("validation_accuracy", acc, on_step=True, on_epoch=True)
 
         return {"val_loss": val_loss, "val_acc": acc}
+    
+    def accuracy(self, est, gt, var):
+        return torch.sum(torch.abs(est - gt) < var) / (torch.numel(est))
+
 
     def configure_optimizers(self):
         # Use Adam optimizer
-        return torch.optim.Adam(self.parameters(), lr=1e-3)
+        return torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5)
 
 
-if __name__ == '__main__':
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize CIFAR-10 images
-    ])
+@hydra.main(config_path="..", config_name="config", version_base="1.1")
+def main(cfg):
+    train_loader = cld.get_dataloader(cfg, cfg.train_path, transform=transforms.Normalize((0, 0, 0, 0, 0, 0),
+                                                                                           (0.5, 0.5, 0.5, 0.5, 0.5, 0.5)))
+    val_loader = cld.get_dataloader(cfg, cfg.val_path, transform=transforms.Normalize((0, 0, 0, 0, 0, 0),
+                                                                                       (0.5, 0.5, 0.5, 0.5, 0.5, 0.5)))
 
-    train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-    val_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+    logger = TensorBoardLogger("/workspaces/confidence_localization/logs", name="DOAMAMBA")
 
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    model = DOAMAMBA(cfg)
 
-    # Declare Logger
-    logger = TensorBoardLogger("tb_logs", name="VAE test")
-
-    # Initialize the model
-    model = CIFAR10Classifier()
-
-
-    # Setup Trainer
     trainer = pl.Trainer(
         logger=logger,
-        max_epochs=5,
+        max_epochs=50,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",  
-        devices=1 if torch.cuda.is_available() else 0 
+        devices=[2,3] if torch.cuda.is_available() else 0
     )
 
-    # Train the model
     trainer.fit(model, train_loader, val_loader)
+
+if __name__ == "__main__":
+    main()
+

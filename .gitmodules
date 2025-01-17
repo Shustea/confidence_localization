@@ -1,0 +1,3 @@
+[submodule "rir-generator"]
+	path = rir-generator
+	url = https://github.com/audiolabs/rir-generator
