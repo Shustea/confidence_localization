@@ -1,15 +1,29 @@
 FROM python:3.8-slim
 
-WORKDIR /workspace
-COPY . .
+RUN useradd -m -s /bin/bash shustea
 
-RUN apt-get update && apt-get install -y \
+WORKDIR /workspace
+
+RUN chown -R shustea:shustea /workspace
+
+USER root
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
     python3-dev \
     libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -r requirements.txt
+USER shustea
 
-CMD ["python", ".\confidence_localization\train.py"]
+# Copy the project files
+COPY . .
+
+# Install Python dependencies
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# Default command to run the application
+CMD ["python", "./confidence_localization/confidence_localization/train.py"]
