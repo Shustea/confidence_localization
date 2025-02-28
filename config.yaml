@@ -1,6 +1,9 @@
 train_path: "/workspaces/confidence_localization/data/processed/train/"
 val_path: "/workspaces/confidence_localization/data/processed/validation/"
 test_path: "/workspaces/confidence_localization/data/processed/test/"
+interim_train_path: "/workspaces/confidence_localization/data/interim/train/"
+interim_val_path: "/workspaces/confidence_localization/data/interim/validation/"
+interim_test_path: "/workspaces/confidence_localization/data/interim/test/"
 target_path: "/workspaces/confidence_localization/data/processed/target/"
 wav_path: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
 log_dir: "/workspaces/confidence_localization/logs/DOAMAMBA"
@@ -9,7 +12,7 @@ save_dir: "/workspaces/confidence_localization/models/"
 batch_size: 4
 num_workers: 4
 
-selective_scan_flag : True
+preprocessed_data_flag : True
 
 delete_all_samples_flag: False
 sample_length_secs: 5
@@ -37,8 +40,6 @@ input_dim : 257
 hidden_dim : 512 #supposed to be 2048
 num_layers : 3
 
-gevd : False
-
 lr : 1e-4
 weight_decay: 1e-5
-epochs: 50
+epochs: 100

@@ -3,8 +3,9 @@ import torch
 from numpy import arange
 from torch import nn
 import torch.nn.functional as F
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from model import Mamba
+from model import ChannelCNN, ResidualBlock, RMSNorm, DOAMAMBA
 from torchvision import transforms
 
 import hydra
@@ -19,22 +20,29 @@ class DOAMAMBA(pl.LightningModule):
     def __init__(self, cfg):
         super(DOAMAMBA, self).__init__()
         self.cfg = cfg
+        self.channel_conv = ChannelCNN(cfg.recivers_num)
+
         self.mamba_layers = nn.ModuleList([
-            Mamba(cfg.input_dim, cfg.hidden_dim, cfg.recivers_num, cfg.selective_scan_flag)
+            ResidualBlock(cfg)
             for _ in range(cfg.num_layers)
         ])
-        # self.channel_conv = nn.Conv2d(2*(cfg.recivers_num - 1), 1, 2*(cfg.recivers_num - 1)-1, padding=2)
+
         self.hidden = nn.Linear(cfg.input_dim, cfg.input_dim)
         self.doa = nn.Linear(cfg.input_dim, cfg.input_dim)
         self.logvar = nn.Linear(cfg.input_dim, cfg.input_dim)
-        # self.batch_norm = nn.BatchNorm2d(2*(cfg.recivers_num - 1))
 
     def forward(self, x):
-        # feature extraction
+        x = self.channel_conv(x)
         for layer in self.mamba_layers:
             x = F.tanh(layer(x))
-        hidden = F.relu(self.hidden(x))
-        return (self.doa(hidden), self.logvar(hidden))
+        x = F.relu(self.hidden(x))
+        return (self.doa(x), self.logvar(x))
+    
+    def unwrap_angle(self, angle):
+        return angle % (2 * torch.pi)
+
+    def accuracy(self, est, gt, var):
+        return torch.sum(torch.abs(est - gt) < var.sqrt()) / torch.numel(est)
     
     def loss(self, doa, logvar, labels):
         l1_loss = ((1/logvar.exp()) * F.l1_loss(doa[~labels.isnan()], labels[~labels.isnan()]) + logvar)
@@ -58,8 +66,7 @@ class DOAMAMBA(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         spectrum, labels = batch
         # spectrum = self.batch_norm(spectrum.float())
-        with torch.no_grad():
-            doa, logvar = self(spectrum)
+        doa, logvar = self(spectrum)
         mae = self.loss(doa, logvar, labels).mean()
         val_loss = ((1/logvar.exp()) * mae + logvar).mean()
         acc = self.accuracy(doa, labels, logvar.exp())
@@ -71,31 +78,54 @@ class DOAMAMBA(pl.LightningModule):
         self.log("mean_MAE_over_speakers", mae.mean(), on_step=True, on_epoch=True, sync_dist=True)
 
         return {"val_loss": val_loss, "val_acc": acc}
-    
-    def accuracy(self, est, gt, var):
-        return torch.sum(torch.abs(est - gt) < var.sqrt()) / (torch.numel(est))
-
 
     def configure_optimizers(self):
         # Use Adam optimizer
-        return torch.optim.Adam(self.parameters(), lr=1e-4, weight_decay=1e-5)
-
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        scheduler = {
+        'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min'),
+        'monitor': 'train_loss'
+        }
+        return {'optimizer': optimizer, 'lr_scheduler': scheduler}
+        
 
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
 def main(cfg):
-    train_loader = cld.get_dataloader(cfg, cfg.train_path)
-    val_loader = cld.get_dataloader(cfg, cfg.val_path)
+    # our_transform = transforms.Normalize(mean=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2], std=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2])
+    train_loader = cld.get_dataloader(cfg, cfg.train_path, cfg.interim_train_path)
+    val_loader = cld.get_dataloader(cfg, cfg.val_path, cfg.interim_val_path)
 
     logger = TensorBoardLogger("/workspaces/confidence_localization/logs", name="DOAMAMBA")
 
     model = DOAMAMBA(cfg)
 
+    checkpoint_loss_callback = ModelCheckpoint(
+    monitor="validation_loss_epoch",  # Monitor validation loss
+    dirpath="./models/",  # Directory where the model is saved
+    filename="best-loss-checkpoint-{epoch:02d}-{validation_loss_epoch:.2f}",
+    save_top_k=2,  # Save only the best model
+    mode="min",  # "min" for loss, "max" for accuracy/metrics
+    save_last=True  # Save the last checkpoint
+    )
+
+    checkpoint_acc_callback = ModelCheckpoint(
+    monitor="validation_accuracy_epoch",  # Monitor validation acc
+    dirpath="./models/",  # Directory where the model is saved
+    filename="best-acc-checkpoint-{epoch:02d}-{validation_accuracy_epoch:.2f}",
+    save_top_k=2,  # Save only the best model
+    mode="max",  # "min" for loss, "max" for accuracy/metrics
+    save_last=True  # Save the last checkpoint
+    )
+
+
     trainer = pl.Trainer(
         logger=logger,
-        max_epochs=50,
+        max_epochs=cfg.epochs,
         accelerator="cuda" if torch.cuda.is_available() else "cpu",  
-        devices=[1,2] if torch.cuda.is_available() else 0,
-        sync_batchnorm=True
+        devices=[5,6,7] if torch.cuda.is_available() else 0,
+        strategy='ddp',
+        sync_batchnorm=True,
+        callbacks=[checkpoint_loss_callback, checkpoint_acc_callback]
     )
 
     trainer.fit(model, train_loader, val_loader)

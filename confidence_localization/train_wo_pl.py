@@ -6,33 +6,12 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from numpy import arange
-from model import Mamba
+from model import DOAMAMBA
 sys.path.append(os.getcwd() + '/data')
 import confidence_localization_dataloader as cld
 from torch.utils.tensorboard import SummaryWriter
 import hydra
 from omegaconf import DictConfig
-
-class DOAMAMBA(nn.Module):
-    def __init__(self, cfg):
-        super(DOAMAMBA, self).__init__()
-        self.cfg = cfg
-        self.mamba_layers = nn.ModuleList([
-            Mamba(cfg.input_dim, cfg.hidden_dim, cfg.recivers_num, cfg.selective_scan_flag)
-            for _ in range(cfg.num_layers)
-        ])
-        self.hidden = nn.Linear(cfg.input_dim, cfg.input_dim)
-        self.doa = nn.Linear(cfg.input_dim, cfg.input_dim)
-        self.logvar = nn.Linear(cfg.input_dim, cfg.input_dim)
-
-    def forward(self, x):
-        for layer in self.mamba_layers:
-            x = F.tanh(layer(x))
-        hidden = F.relu(self.hidden(x))
-        return (self.doa(hidden), self.logvar(hidden))
-
-    def accuracy(self, est, gt, var):
-        return torch.sum(torch.abs(est - gt) < var.sqrt()) / torch.numel(est)
 
 
 def train(model, dataloader, optimizer, device, writer, epoch):
@@ -48,12 +27,13 @@ def train(model, dataloader, optimizer, device, writer, epoch):
         train_loss = (
             (1 / logvar.exp()) * loss_func(doa[~labels.isnan()], labels[~labels.isnan()])
             + logvar
-        ).sum()
+        ).mean()
+
         train_loss.backward()
         optimizer.step()
 
         total_loss += train_loss.item()
-        writer.add_scalar("Train/Loss", train_loss.item(), epoch * len(dataloader) + batch_idx)
+        writer.add_scalar("train_loss", train_loss.item(), epoch * len(dataloader) + batch_idx)
 
     return total_loss / len(dataloader)
 
@@ -69,7 +49,7 @@ def validate(model, dataloader, device, writer, epoch):
             spectrum, labels = [x.to(device) for x in batch]
             doa, logvar = model(spectrum)
             mae = loss_func(doa[~labels.isnan()], labels[~labels.isnan()])
-            val_loss = ((1 / logvar.exp()) * mae + logvar).sum()
+            val_loss = ((1 / logvar.exp()) * mae + logvar).mean()
             acc = model.accuracy(doa[~labels.isnan()], labels[~labels.isnan()], logvar[~labels.isnan()].exp())
 
             total_loss += val_loss.item()
@@ -77,11 +57,11 @@ def validate(model, dataloader, device, writer, epoch):
 
             global_step = epoch * len(dataloader) + batch_idx
 
-            writer.add_scalar("Validation/Loss", val_loss.item(), global_step)
-            writer.add_scalar("Validation/Accuracy", acc.item(), global_step)
-            writer.add_scalar("Validation/Mean_std_over_speakers", logvar.exp()[~labels.isnan()].mean().item(), global_step)
-            writer.add_scalar("Validation/Mean_std_over_noise", logvar.exp()[labels.isnan()].mean().item(), global_step)
-            writer.add_scalar("Validation/Mean_MAE_over_speakers", mae.mean().item(), global_step)
+            writer.add_scalar("validation_loss", val_loss.item(), global_step)
+            writer.add_scalar("validation_accuracy", acc.item(), global_step)
+            writer.add_scalar("mean_std_over_speakers", logvar.exp()[~labels.isnan()].mean().item(), global_step)
+            writer.add_scalar("mean_std_over_noise", logvar.exp()[labels.isnan()].mean().item(), global_step)
+            writer.add_scalar("mean_MAE_over_speakers", mae.mean().item(), global_step)
 
     return total_loss / len(dataloader), total_acc / len(dataloader)
 
@@ -94,8 +74,8 @@ def main(cfg: DictConfig):
     torch.cuda.empty_cache()
 
     # Prepare data loaders
-    train_loader = cld.get_dataloader(cfg, cfg.train_path, num_workers=cfg.num_workers, shuffle=True)
-    val_loader = cld.get_dataloader(cfg, cfg.val_path, num_workers=cfg.num_workers, shuffle=False)
+    train_loader = cld.get_dataloader(cfg, cfg.train_path, shuffle=True)
+    val_loader = cld.get_dataloader(cfg, cfg.val_path, shuffle=False)
 
     # Initialize model, optimizer, and device
     model = DOAMAMBA(cfg).to(device)

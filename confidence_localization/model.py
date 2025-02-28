@@ -1,85 +1,91 @@
+from numpy import ceil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange, repeat, einsum
 
-class Mamba(nn.Module):
-    def __init__(self, input_dim, hidden_dim, receivers_num, selective_scan_flag):
-        super(Mamba, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.selective_scan_flag = selective_scan_flag
-
-        self.in_projection = nn.Linear(input_dim, 2 * hidden_dim, bias=False)
-
+class ChannelCNN(nn.Module):
+    def __init__(self, receivers_num=4):
+        super(ChannelCNN, self).__init__()
         self.channel_conv = nn.Conv2d(2*(receivers_num - 1), 1, 2*(receivers_num - 1)-1, padding=2)
 
-        self.conv1d = nn.Conv1d(hidden_dim, hidden_dim,
+    def forward(self, x):
+        return self.channel_conv(x.permute(0,1,-1,-2)).squeeze(1)
+
+class MambaBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, receivers_num):
+        super(MambaBlock, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        
+        self.dt_rank = int(ceil(self.hidden_dim / 8))
+        # self.dt_rank = self.hidden_dim
+
+        #Define NN
+
+        self.in_projection = nn.Linear(input_dim, 2 * self.hidden_dim, bias=False)
+
+        self.conv1d = nn.Conv1d(self.hidden_dim, self.hidden_dim,
                                  kernel_size=2*(receivers_num - 1)-1, 
-                                 groups=hidden_dim,
+                                 groups=self.hidden_dim,
                                  padding=2*(receivers_num - 1)-2 #casual
         )
 
         self.x_projection = nn.Linear(
-            hidden_dim,
-            hidden_dim * 3,
+            self.hidden_dim,
+            self.hidden_dim * 2 + self.dt_rank,
             bias=False
         )
 
         self.delta_t_projection = nn.Linear(
-            hidden_dim, 
-            input_dim, 
+            self.dt_rank, 
+            self.input_dim, 
             bias=True
         )
 
         # State-space model parameters
 
-        self.A_log = nn.Parameter(
-            torch.log(repeat(
-            torch.arange(1, input_dim + 1, dtype=torch.float32),
-            'n -> n d', d=hidden_dim
-        )), 
+        self.log_A = nn.Parameter(
+                   torch.zeros(input_dim, hidden_dim)
+        , 
             requires_grad=True
         )
 
         self.D = nn.Parameter(
-            torch.ones(hidden_dim, dtype=torch.float32),
+            torch.ones(self.hidden_dim, dtype=torch.float32),
             requires_grad=True
         )
 
         self.out_projection = nn.Linear(
-            hidden_dim, input_dim
+            self.hidden_dim, input_dim
         )
 
+        # self.initialization()
+
+    # def initialization(self):
+    #     nn.init.xavier_uniform_(self.A)
+
     def ssm(self, x):
-        _, n = self.A_log.shape
+        d, n = self.log_A.shape
 
         # Compute state space parameters
-        A = -torch.exp(self.A_log)  # shape -> (d_in, n)
-        D = self.D
-
+        A = -torch.exp(self.log_A).float() # shape -> (d_in, n)
+        D = self.D.float()
 
         x_dbl = self.x_projection(x)  # shape -> (batch, input, seq_len)
 
         delta, B, C = torch.split(
             x_dbl, 
-            [n, n, n], 
+            [self.dt_rank, self.hidden_dim, self.hidden_dim], 
             dim=-1
         )
 
-        delta = F.softplus(self.delta_t_projection(delta))  # shape -> (batch, seq_len, model_internal_dim)
+        delta = F.silu(self.delta_t_projection(delta))  # shape -> (batch, seq_len, model_internal_dim)
 
-        if self.selective_scan_flag:
-            return self.selective_scan(x, delta, A, B, C, D)
-        else:
-            return self.selective_scan_time_serial(x, delta, A, B, C, D)
-
+        return self.selective_scan(x, delta, A, B, C, D)
+        
     def forward(self, x):
-        if len(x.shape) > 3:
-            seq_len= x.shape[-1]
-            x = self.channel_conv(x.permute(0,1,-1,-2)).squeeze(1)
-        else:
-            seq_len = x.shape[-2]
+        seq_len = x.shape[-2]
 
         x_and_res = self.in_projection(x)
         x, res = torch.split(x_and_res, [self.hidden_dim, self.hidden_dim], dim=-1)
@@ -102,16 +108,13 @@ class Mamba(nn.Module):
         
         dA_cumsum = torch.flip(dA_cumsum, dims=[1])  # Flip along axis 1
         
-        # Cumulative sum along all the input tokens, parallel prefix sum, 
-        # calculates dA for all the input tokens parallely
-        dA_cumsum = torch.cumsum(dA_cumsum, dim=1) 
-
-        # second step of A_bar = exp(ΔA), i.e., exp(ΔA)
+        # "Prefix-sum" of dA along the sequence dimension
+        dA_cumsum = torch.cumsum(dA_cumsum, dim=1)
         dA_cumsum = torch.exp(dA_cumsum)  
+
         dA_cumsum = torch.flip(dA_cumsum, dims=[1])  # Flip back along axis 1
 
         x = dB_u * dA_cumsum
-        # 1e-12 to avoid division by 0
         x = torch.cumsum(x, dim=1) / (dA_cumsum + 1e-12) 
 
         y = torch.einsum('bldn,bln->bln', x, C)
@@ -119,29 +122,55 @@ class Mamba(nn.Module):
         return y + u * D.to(u.device)
     
 
-    def selective_scan_time_serial(self, u, delta, A, B, C, D):
-        batch_size, L, hidden = u.shape
-        N = A.shape[0]  # Assuming A, B, C have the same last dimension N
+class RMSNorm(nn.Module):
+    def __init__(self,
+                 d_model: int,
+                 eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d_model))
 
-        # Initialize output tensor
-        y = torch.zeros((batch_size, L, hidden), device=u.device)
 
-        # Initialize recurrent variables
-        A_bar = torch.ones((batch_size, N, hidden), device=u.device)  # Accumulating exp(ΔA)
-        x_accum = torch.zeros((batch_size, N, hidden), device=u.device)  # Accumulating x
+    def forward(self, x):
+        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+        return output
+    
+
+class ResidualBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.layer = MambaBlock(cfg.input_dim, cfg.hidden_dim, cfg.recivers_num)
+        self.norm = RMSNorm(cfg.input_dim)
+
+    def forward(self, x):
+        return self.layer(self.norm(x)) + x
+    
+
+class DOAMAMBA(nn.Module):
+    def __init__(self, cfg):
+        super(DOAMAMBA, self).__init__()
+        self.cfg = cfg
+        self.channel_conv = ChannelCNN(cfg.recivers_num)
+        self.mamba_layers = nn.ModuleList([
+            ResidualBlock(cfg)
+            for _ in range(cfg.num_layers)
+        ])
+
+        self.hidden = nn.Linear(cfg.input_dim, cfg.input_dim)
+        self.doa = nn.Linear(cfg.input_dim, cfg.input_dim)
+        self.logvar = nn.Linear(cfg.input_dim, cfg.input_dim)
+
+    def forward(self, x):
+        x = self.channel_conv(x)
+        for layer in self.mamba_layers:
+            x = F.tanh(layer(x))
+        hidden = F.relu(self.hidden(x))
+        return (self.unwrap_angle(self.doa(hidden)), self.logvar(hidden))
+    
+    def unwrap_angle(self, angle):
+        return angle % (2 * torch.pi)
+
+    def accuracy(self, est, gt, var):
+        return torch.sum(torch.abs(est - gt) < var.sqrt()) / torch.numel(est)
         
-        for t in range(L):
-            
-            dA = torch.einsum('bd,dn->bdn', delta[:, t], A)
-            dB_u = torch.einsum('bd,bn,bn->bdn', delta[:, t], u[:, t], B[:,t,:])
-
-            # Compute A_bar recursively
-            A_bar.mul_(torch.exp(dA))
-
-            # Compute x accumulation
-            x_accum.add_(dB_u * A_bar)
-
-            # Compute output
-            y[:, t] = torch.einsum('bdn,bn->bn', x_accum / (A_bar + 1e-12), C[:, t, :])
-
-        return y + u * D.to(u.device)
