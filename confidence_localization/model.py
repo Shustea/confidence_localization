@@ -45,9 +45,11 @@ class MambaBlock(nn.Module):
 
         # State-space model parameters
 
-        self.log_A = nn.Parameter(
-                   torch.zeros(input_dim, hidden_dim)
-        , 
+        self.A_log = nn.Parameter(
+            torch.log(repeat(
+            torch.arange(1, input_dim + 1, dtype=torch.float32),
+            'n -> n d', d=hidden_dim
+        )), 
             requires_grad=True
         )
 
@@ -57,7 +59,7 @@ class MambaBlock(nn.Module):
         )
 
         self.out_projection = nn.Linear(
-            self.hidden_dim, input_dim
+            self.hidden_dim, input_dim, bias=False
         )
 
         # self.initialization()
@@ -66,10 +68,10 @@ class MambaBlock(nn.Module):
     #     nn.init.xavier_uniform_(self.A)
 
     def ssm(self, x):
-        d, n = self.log_A.shape
+        d, n = self.A_log.shape
 
         # Compute state space parameters
-        A = -torch.exp(self.log_A).float() # shape -> (d_in, n)
+        A = -torch.exp(self.A_log) # shape -> (d_in, n)
         D = self.D.float()
 
         x_dbl = self.x_projection(x)  # shape -> (batch, input, seq_len)
@@ -80,9 +82,9 @@ class MambaBlock(nn.Module):
             dim=-1
         )
 
-        delta = F.silu(self.delta_t_projection(delta))  # shape -> (batch, seq_len, model_internal_dim)
+        delta = F.softplus(self.delta_t_projection(delta))  # shape -> (batch, seq_len, model_internal_dim)
 
-        return self.selective_scan(x, delta, A, B, C, D)
+        return selective_scan(x, delta, A, B, C, D)
         
     def forward(self, x):
         seq_len = x.shape[-2]
@@ -100,26 +102,32 @@ class MambaBlock(nn.Module):
 
         return self.out_projection(y)
 
-    def selective_scan(self, u, delta, A, B, C, D):
-        dA = torch.einsum('bld,dn->bldn', delta, A)
-        dB_u = torch.einsum('bld,bln,bln->bldn', delta, u, B)
+def complex_log(input, eps=1e-12):
+    eps = input.new_tensor(eps)
+    real = input.abs().maximum(eps).log()
+    imag = (input < 0).to(input.dtype) * torch.pi
+    return torch.complex(real, imag)
 
-        dA_cumsum = F.pad(dA[:, 1:], (0, 0, 0, 0, 1, 1, 0, 0))[:, 1:]
-        
-        dA_cumsum = torch.flip(dA_cumsum, dims=[1])  # Flip along axis 1
-        
-        # "Prefix-sum" of dA along the sequence dimension
-        dA_cumsum = torch.cumsum(dA_cumsum, dim=1)
-        dA_cumsum = torch.exp(dA_cumsum)  
+def selective_scan(u, dt, A, B, C, D, mode='cumsum'):
+    dA = torch.einsum('bld,dn->bldn', dt, A)
+    dB_u = torch.einsum('bld,bln,bln->bldn', dt, u, B)
+    dA = dA.clamp(min=-20)
+    
+    padding =  (0, 0, 0, 0, 1, 0)
 
-        dA_cumsum = torch.flip(dA_cumsum, dims=[1])  # Flip back along axis 1
-
-        x = dB_u * dA_cumsum
-        x = torch.cumsum(x, dim=1) / (dA_cumsum + 1e-12) 
-
+    if mode=='cumsum':            
+        dA_cumsum = F.pad(dA[:, 1:], padding).cumsum(1).exp()
+        x = dB_u / (dA_cumsum + 1e-12)
+        x = x.cumsum(1) * dA_cumsum
         y = torch.einsum('bldn,bln->bln', x, C)
     
-        return y + u * D.to(u.device)
+    elif mode=='logcumsumexp':  # more numerically stable (Heisen sequence)
+        dB_u_log = complex_log(dB_u)
+        dA_star = F.pad(dA[:, 1:].cumsum(1), padding)
+        x_log = torch.logcumsumexp(dB_u_log - dA_star, 1) + dA_star
+        y = torch.einsum('bldn,bln->bln', x_log.real.exp() * torch.cos(x_log.imag), C)
+            
+    return y + u * D
     
 
 class RMSNorm(nn.Module):

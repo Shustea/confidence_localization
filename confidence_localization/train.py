@@ -1,12 +1,13 @@
 import pytorch_lightning as pl
 import torch
-from numpy import arange
+from numpy import arange, unique
 from torch import nn
 import torch.nn.functional as F
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from model import ChannelCNN, ResidualBlock, RMSNorm, DOAMAMBA
 from torchvision import transforms
+import matplotlib.pyplot as plt
 
 import hydra
 
@@ -45,39 +46,44 @@ class DOAMAMBA(pl.LightningModule):
         return torch.sum(torch.abs(est - gt) < var.sqrt()) / torch.numel(est)
     
     def loss(self, doa, logvar, labels):
-        l1_loss = ((1/logvar.exp()) * F.l1_loss(doa[~labels.isnan()], labels[~labels.isnan()]) + logvar)
+        mae = F.l1_loss(doa[~labels.isnan()], labels[~labels.isnan()])
+        l1_loss = (1/(logvar.exp()) * mae + logvar)
         # ways to improve loss:
         #
         # instead of adding logvar add logvar[~labels.isnan()] + [labels.isnan()]
         #
         # maybe we should force the accuracy to be ~68% (std inclusion rate)
         # (self.accuracy(doa, labels, logvar.exp()) - 68.2).abs()
-        return l1_loss
+        return l1_loss, mae
 
     def training_step(self, batch, batch_idx):
         spectrum, labels = batch
         # spectrum = self.batch_norm(spectrum.float())
         doa, logvar = self(spectrum)
         #about loss - maybe the logvar should be more aggresive?
-        train_loss = self.loss(doa, logvar, labels).mean()
-        self.log("train_loss", train_loss, on_step=True, on_epoch=True, sync_dist=True)
-        return train_loss.to(dtype=torch.float32)
+        train_loss, _ = self.loss(doa, logvar, labels)
+        self.log("train_loss", train_loss.mean(), on_step=True, on_epoch=True, sync_dist=True)
+        return train_loss.mean().to(dtype=torch.float32)
 
     def validation_step(self, batch, batch_idx):
         spectrum, labels = batch
         # spectrum = self.batch_norm(spectrum.float())
         doa, logvar = self(spectrum)
-        mae = self.loss(doa, logvar, labels).mean()
-        val_loss = ((1/logvar.exp()) * mae + logvar).mean()
+        if batch_idx==0:
+            if (len(unique(labels[1][~labels[1].isnan()].cpu())) > 1):
+                save_sample_as_image(labels[1], labels[1], 'example_gt.png')
+                save_sample_as_image(doa[1], labels[1],'DOA_example.png')
+                save_sample_as_image(logvar[1], labels[1], 'logvar_example.png')
+        val_loss, mae = self.loss(doa, logvar, labels)
         acc = self.accuracy(doa, labels, logvar.exp())
         
-        self.log("validation_loss", val_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("validation_accuracy", acc, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("validation_loss", val_loss.mean(), on_step=True, on_epoch=True, sync_dist=True)
+        self.log("validation_accuracy", acc.mean(), on_step=True, on_epoch=True, sync_dist=True)
         self.log("mean_std_over_speakers", logvar.exp()[~labels.isnan()].mean(), on_step=True, on_epoch=True, sync_dist=True)
         self.log("mean_std_over_noise", logvar.exp()[labels.isnan()].mean(), on_step=True, on_epoch=True, sync_dist=True)
         self.log("mean_MAE_over_speakers", mae.mean(), on_step=True, on_epoch=True, sync_dist=True)
 
-        return {"val_loss": val_loss, "val_acc": acc}
+        return {"val_loss": val_loss.mean(), "val_acc": acc.mean()}
 
     def configure_optimizers(self):
         # Use Adam optimizer
@@ -129,6 +135,23 @@ def main(cfg):
     )
 
     trainer.fit(model, train_loader, val_loader)
+
+def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
+    # Ensure tensor is on CPU and detach if it's a computation graph tensor
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+    tensor = tensor.detach()
+
+    plt.figure()
+    plt.imshow(tensor.numpy().T, origin='lower')
+    plt.axis("off")
+    plt.colorbar()
+
+    plt.title(f'{str(unique(label[~label.isnan()].cpu()))}', fontsize=14, fontweight="bold")
+
+    # Save the image
+    plt.savefig(path + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
+    plt.close()
 
 if __name__ == "__main__":
     main()
