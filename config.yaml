@@ -39,7 +39,8 @@ eps: 1e-6
 input_dim : 257
 hidden_dim : 512 #supposed to be 2048
 num_layers : 3
+res_alpha : 0.1
 
-lr : 1e-4
+lr : 1e-3
 weight_decay: 1e-5
 epochs: 100

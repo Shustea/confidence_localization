@@ -2,12 +2,17 @@ from numpy import ceil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models import densenet121
 from einops import rearrange, repeat, einsum
 
 class ChannelCNN(nn.Module):
     def __init__(self, receivers_num=4):
         super(ChannelCNN, self).__init__()
-        self.channel_conv = nn.Conv2d(2*(receivers_num - 1), 1, 2*(receivers_num - 1)-1, padding=2)
+        self.channel_conv = nn.Sequential(
+        nn.Conv2d(2*(receivers_num - 1), (receivers_num - 1), 2*(receivers_num - 1)-1, padding=2),
+        nn.ReLU(),
+        nn.Conv2d((receivers_num - 1), 1, (receivers_num - 1), padding=1)
+        )
 
     def forward(self, x):
         return self.channel_conv(x.permute(0,1,-1,-2)).squeeze(1)
@@ -87,6 +92,8 @@ class MambaBlock(nn.Module):
         return selective_scan(x, delta, A, B, C, D)
         
     def forward(self, x):
+        if len(x.shape) < 3:
+            x = x.unsqueeze(0)
         seq_len = x.shape[-2]
 
         x_and_res = self.in_projection(x)
@@ -152,33 +159,187 @@ class ResidualBlock(nn.Module):
         self.norm = RMSNorm(cfg.input_dim)
 
     def forward(self, x):
-        return self.layer(self.norm(x)) + x
+        return self.norm(self.layer(x)) + x
     
+    
+class UNet1D(nn.Module):
+    def __init__(self, in_channels=257, out_channels=2, base_features=64):
+        """
+        1D U-Net.
+        
+        Args:
+            in_channels  (int): Number of input channels.
+            out_channels (int): Number of output channels (e.g., 2 for doa/logvar).
+            base_features(int): Number of feature maps in the first encoder layer.
+        """
+        super(UNet1D, self).__init__()
 
-class DOAMAMBA(nn.Module):
-    def __init__(self, cfg):
-        super(DOAMAMBA, self).__init__()
-        self.cfg = cfg
-        self.channel_conv = ChannelCNN(cfg.recivers_num)
-        self.mamba_layers = nn.ModuleList([
-            ResidualBlock(cfg)
-            for _ in range(cfg.num_layers)
-        ])
+        self.enc1 = self.double_conv(in_channels, base_features)
+        self.pool1 = nn.MaxPool1d(kernel_size=2, stride=2)
 
-        self.hidden = nn.Linear(cfg.input_dim, cfg.input_dim)
-        self.doa = nn.Linear(cfg.input_dim, cfg.input_dim)
-        self.logvar = nn.Linear(cfg.input_dim, cfg.input_dim)
+        self.enc2 = self.double_conv(base_features, base_features * 2)
+        self.pool2 = nn.MaxPool1d(kernel_size=2, stride=2)
+
+        # we can extend the U-Net depth by adding more encoders/pools.
+        # For brevity, let's keep it two-level here.
+
+        self.bottleneck = self.double_conv(base_features * 2, base_features * 4)
+
+        self.up2 = nn.ConvTranspose1d(
+            base_features * 4, base_features * 2, kernel_size=2, stride=2, output_padding=1
+        )
+        self.dec2 = self.double_conv(base_features * 4, base_features * 2)
+
+        self.up1 = nn.ConvTranspose1d(
+            base_features * 2, base_features, kernel_size=2, stride=2
+        )
+        self.dec1 = self.double_conv(base_features * 2, base_features)
+
+        self.out_conv = nn.Conv1d(base_features, out_channels, kernel_size=1)
 
     def forward(self, x):
-        x = self.channel_conv(x)
-        for layer in self.mamba_layers:
-            x = F.tanh(layer(x))
-        hidden = F.relu(self.hidden(x))
-        return (self.unwrap_angle(self.doa(hidden)), self.logvar(hidden))
-    
-    def unwrap_angle(self, angle):
-        return angle % (2 * torch.pi)
+        """
+        Forward pass of the 1D U-Net.
+        x shape: (batch_size, in_channels, seq_len)
+        """
+        e1 = self.enc1(x)         
+        p1 = self.pool1(e1)       
 
-    def accuracy(self, est, gt, var):
-        return torch.sum(torch.abs(est - gt) < var.sqrt()) / torch.numel(est)
+        e2 = self.enc2(p1)        
+        p2 = self.pool2(e2)       
+
+        b = self.bottleneck(p2)   
+
+        u2 = self.up2(b)          
+        c2 = torch.cat([u2, e2], dim=1)  
+        d2 = self.dec2(c2)       
+
+        u1 = self.up1(d2)         
+        c1 = torch.cat([u1, e1], dim=1)
+        d1 = self.dec1(c1)        
+
+        out = self.out_conv(d1)
+        return out
+    
+    def double_conv(self, in_ch, out_ch):
+        """
+        for Unet
+        """
+        return nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+    
+class UNet2D(nn.Module):
+    def __init__(self, in_channels=6, out_channels=2, base_features=64):
+        """
+        2D U-Net.
         
+        Args:
+            in_channels  (int): Number of input channels.
+            out_channels (int): Number of output channels (e.g., 2 for doa/logvar).
+            base_features(int): Number of feature maps in the first encoder layer.
+        """
+        super(UNet2D, self).__init__()
+
+        self.enc1 = self.double_conv(in_channels, base_features)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.enc2 = self.double_conv(base_features, base_features * 2)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # we can extend the U-Net depth by adding more encoders/pools.
+        # For brevity, let's keep it two-level here.
+
+        self.bottleneck = self.double_conv(base_features * 2, base_features * 4)
+
+        self.up2 = nn.ConvTranspose2d(
+            base_features * 4,
+            base_features * 2, 
+            kernel_size=2, 
+            stride=2, 
+            output_padding=(1, 0)
+        )
+        self.dec2 = self.double_conv(base_features * 4, base_features * 2)
+
+        self.up1 = nn.ConvTranspose2d(
+            base_features * 2, 
+            base_features, 
+            kernel_size=2, 
+            stride=2, 
+            output_padding=(0, 1)
+        )
+        self.dec1 = self.double_conv(base_features * 2, base_features)
+
+        self.out_conv = nn.Conv2d(base_features, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        """
+        Forward pass of the 2D U-Net.
+        x shape: (batch_size, in_channels, height, width)
+        """
+        e1 = self.enc1(x)         
+        p1 = self.pool1(e1)       
+
+        e2 = self.enc2(p1)        
+        p2 = self.pool2(e2)       
+
+        b = self.bottleneck(p2)   
+
+        u2 = self.up2(b)          
+        c2 = torch.cat([u2, e2], dim=1)  
+        d2 = self.dec2(c2)       
+
+        u1 = self.up1(d2)         
+        c1 = torch.cat([u1, e1], dim=1)
+        d1 = self.dec1(c1)        
+
+        out = self.out_conv(d1)
+        return out
+    
+    def double_conv(self, in_ch, out_ch):
+        """
+        for Unet
+        """
+        return nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+    
+class FeatureEncoder(nn.Module):
+    def __init__(self, receivers_num=4, dilation=2):
+        super(FeatureEncoder, self).__init__()
+        
+        self.pre_conv = nn.Sequential(
+            nn.Conv2d(2*(receivers_num-1), 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU()
+        )
+
+        densenet = densenet121(pretrained=False)
+        
+        densenet.features[0] = nn.Conv2d(64, 64, kernel_size=7, stride=2, padding=dilation, dilation=dilation, bias=False)
+
+        for module in densenet.features:
+            if isinstance(module, nn.Conv2d):
+                module.dilation = (dilation, dilation)
+                module.padding = (dilation, dilation)
+
+        self.dense_core = densenet.features
+
+        self.post_conv = nn.Sequential(
+            nn.Conv2d(1024, 1, kernel_size=1),
+            nn.BatchNorm2d(1),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        x = self.pre_conv(x)
+        return x

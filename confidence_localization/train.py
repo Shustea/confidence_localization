@@ -5,7 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from model import ChannelCNN, ResidualBlock, RMSNorm, DOAMAMBA
+from model import *
 from torchvision import transforms
 import matplotlib.pyplot as plt
 
@@ -21,23 +21,27 @@ class DOAMAMBA(pl.LightningModule):
     def __init__(self, cfg):
         super(DOAMAMBA, self).__init__()
         self.cfg = cfg
-        self.channel_conv = ChannelCNN(cfg.recivers_num)
+        self.channel_encoder = ChannelCNN(cfg.recivers_num)
 
         self.mamba_layers = nn.ModuleList([
             ResidualBlock(cfg)
             for _ in range(cfg.num_layers)
         ])
 
-        self.hidden = nn.Linear(cfg.input_dim, cfg.input_dim)
-        self.doa = nn.Linear(cfg.input_dim, cfg.input_dim)
-        self.logvar = nn.Linear(cfg.input_dim, cfg.input_dim)
+        self.doa = nn.Linear(cfg.input_dim, cfg.input_dim, bias=False)
+
+        self.logvar = nn.Conv2d(1, 1, kernel_size=7, padding=3)
 
     def forward(self, x):
-        x = self.channel_conv(x)
+        x = self.channel_encoder(x).squeeze()
+
         for layer in self.mamba_layers:
-            x = F.tanh(layer(x))
-        x = F.relu(self.hidden(x))
-        return (self.doa(x), self.logvar(x))
+            x = torch.tanh(layer(x))
+
+        doa = F.silu(self.doa(x))
+        logvar = F.silu(self.logvar(doa.unsqueeze(1)).squeeze(1))
+
+        return doa, logvar
     
     def unwrap_angle(self, angle):
         return angle % (2 * torch.pi)
@@ -73,7 +77,8 @@ class DOAMAMBA(pl.LightningModule):
             if (len(unique(labels[1][~labels[1].isnan()].cpu())) > 1):
                 save_sample_as_image(labels[1], labels[1], 'example_gt.png')
                 save_sample_as_image(doa[1], labels[1],'DOA_example.png')
-                save_sample_as_image(logvar[1], labels[1], 'logvar_example.png')
+                save_sample_as_image(logvar[1].exp(), labels[1], 'logvar_example.png')
+                save_doas(doa[1], labels[1], 'doa_distribiution.png')
         val_loss, mae = self.loss(doa, logvar, labels)
         acc = self.accuracy(doa, labels, logvar.exp())
         
@@ -87,7 +92,7 @@ class DOAMAMBA(pl.LightningModule):
 
     def configure_optimizers(self):
         # Use Adam optimizer
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
         scheduler = {
         'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min'),
         'monitor': 'train_loss'
@@ -128,7 +133,7 @@ def main(cfg):
         logger=logger,
         max_epochs=cfg.epochs,
         accelerator="cuda" if torch.cuda.is_available() else "cpu",  
-        devices=[5,6,7] if torch.cuda.is_available() else 0,
+        devices=[0, 1, 2] if torch.cuda.is_available() else 0,
         strategy='ddp',
         sync_batchnorm=True,
         callbacks=[checkpoint_loss_callback, checkpoint_acc_callback]
@@ -146,6 +151,21 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, filename: st
     plt.imshow(tensor.numpy().T, origin='lower')
     plt.axis("off")
     plt.colorbar()
+
+    plt.title(f'{str(unique(label[~label.isnan()].cpu()))}', fontsize=14, fontweight="bold")
+
+    # Save the image
+    plt.savefig(path + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
+    plt.close()
+
+def save_doas(tensor: torch.Tensor, label: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
+    # Ensure tensor is on CPU and detach if it's a computation graph tensor
+    if tensor.is_cuda:
+        tensor = tensor.cpu()
+    tensor = tensor.detach()
+
+    plt.figure()
+    plt.hist(tensor.numpy(), bins=20)
 
     plt.title(f'{str(unique(label[~label.isnan()].cpu()))}', fontsize=14, fontweight="bold")
 
