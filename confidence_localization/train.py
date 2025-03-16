@@ -28,9 +28,9 @@ class DOAMAMBA(pl.LightningModule):
             for _ in range(cfg.num_layers)
         ])
 
-        self.doa = nn.Linear(cfg.input_dim, cfg.input_dim, bias=False)
+        self.doa = nn.Conv2d(1, cfg.num_classes, kernel_size=1)
 
-        self.logvar = nn.Conv2d(1, 1, kernel_size=7, padding=3)
+        self.logvar = nn.Linear(cfg.num_classes, 1)
 
     def forward(self, x):
         x = self.channel_encoder(x).squeeze()
@@ -38,10 +38,11 @@ class DOAMAMBA(pl.LightningModule):
         for layer in self.mamba_layers:
             x = torch.tanh(layer(x))
 
-        doa = F.silu(self.doa(x))
-        logvar = F.silu(self.logvar(doa.unsqueeze(1)).squeeze(1))
+        logits = self.doa(x.unsqueeze(1)).permute(0, -2, -1, 1)
+        doa = F.softmax(logits, dim=-1) # Confidence distribution over classes.
+        logvar = self.logvar(doa).squeeze(-1)  
 
-        return doa, logvar
+        return logits, doa, logvar
     
     def unwrap_angle(self, angle):
         return angle % (2 * torch.pi)
@@ -49,46 +50,32 @@ class DOAMAMBA(pl.LightningModule):
     def accuracy(self, est, gt, var):
         return torch.sum(torch.abs(est - gt) < var.sqrt()) / torch.numel(est)
     
-    def loss(self, doa, logvar, labels):
-        mae = F.l1_loss(doa[~labels.isnan()], labels[~labels.isnan()])
-        l1_loss = (1/(logvar.exp()) * mae + logvar)
-        # ways to improve loss:
-        #
-        # instead of adding logvar add logvar[~labels.isnan()] + [labels.isnan()]
-        #
-        # maybe we should force the accuracy to be ~68% (std inclusion rate)
-        # (self.accuracy(doa, labels, logvar.exp()) - 68.2).abs()
-        return l1_loss, mae
+    def loss(self, logits, pred, logvar, labels):
+        # Cross entropy loss: labels should be LongTensor with class indices.
+        loss_val = F.cross_entropy(logits.to(dtype=float), labels.to(dtype=float))
+        acc = torch.mean(torch.abs(self.accuracy(torch.argmax(pred, dim=-1),
+                                        torch.argmax(labels, dim=-1), logvar.exp()) - 68.2))
+        return loss_val + self.cfg.loss_gamma * acc
 
     def training_step(self, batch, batch_idx):
         spectrum, labels = batch
-        # spectrum = self.batch_norm(spectrum.float())
-        doa, logvar = self(spectrum)
-        #about loss - maybe the logvar should be more aggresive?
-        train_loss, _ = self.loss(doa, logvar, labels)
-        self.log("train_loss", train_loss.mean(), on_step=True, on_epoch=True, sync_dist=True)
-        return train_loss.mean().to(dtype=torch.float32)
+        logits, doa, logvar = self(spectrum)
+        train_loss = self.loss(logits, doa, logvar, labels)
+        self.log("train_loss", train_loss, on_step=True, on_epoch=True, sync_dist=True)
+        return train_loss
 
     def validation_step(self, batch, batch_idx):
         spectrum, labels = batch
-        # spectrum = self.batch_norm(spectrum.float())
-        doa, logvar = self(spectrum)
-        if batch_idx==0:
-            if (len(unique(labels[1][~labels[1].isnan()].cpu())) > 1):
-                save_sample_as_image(labels[1], labels[1], 'example_gt.png')
-                save_sample_as_image(doa[1], labels[1],'DOA_example.png')
-                save_sample_as_image(logvar[1].exp(), labels[1], 'logvar_example.png')
-                save_doas(doa[1], labels[1], 'doa_distribiution.png')
-        val_loss, mae = self.loss(doa, logvar, labels)
-        acc = self.accuracy(doa, labels, logvar.exp())
-        
-        self.log("validation_loss", val_loss.mean(), on_step=True, on_epoch=True, sync_dist=True)
-        self.log("validation_accuracy", acc.mean(), on_step=True, on_epoch=True, sync_dist=True)
-        self.log("mean_std_over_speakers", logvar.exp()[~labels.isnan()].mean(), on_step=True, on_epoch=True, sync_dist=True)
-        self.log("mean_std_over_noise", logvar.exp()[labels.isnan()].mean(), on_step=True, on_epoch=True, sync_dist=True)
-        self.log("mean_MAE_over_speakers", mae.mean(), on_step=True, on_epoch=True, sync_dist=True)
+        logits, doa, logvar = self(spectrum)
+        val_loss = self.loss(logits, doa, logvar, labels)
 
-        return {"val_loss": val_loss.mean(), "val_acc": acc.mean()}
+        # Calculate accuracy.
+        preds = torch.argmax(doa, dim=-1)
+        acc = (preds == torch.argmax(labels, dim=-1)).float().mean()
+
+        self.log("validation_loss", val_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("validation_accuracy", acc, on_step=True, on_epoch=True, sync_dist=True)
+        return {"val_loss": val_loss, "val_acc": acc}
 
     def configure_optimizers(self):
         # Use Adam optimizer
@@ -133,7 +120,7 @@ def main(cfg):
         logger=logger,
         max_epochs=cfg.epochs,
         accelerator="cuda" if torch.cuda.is_available() else "cpu",  
-        devices=[0, 1, 2] if torch.cuda.is_available() else 0,
+        devices=[0,1,2] if torch.cuda.is_available() else 0,
         strategy='ddp',
         sync_batchnorm=True,
         callbacks=[checkpoint_loss_callback, checkpoint_acc_callback]
