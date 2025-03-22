@@ -1,6 +1,6 @@
 import pytorch_lightning as pl
 import torch
-from numpy import arange, unique
+from numpy import arange, unique, deg2rad
 from torch import nn
 import torch.nn.functional as F
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -8,6 +8,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from model import *
 from torchvision import transforms
 import matplotlib.pyplot as plt
+from confidence_localization.util import save_sample_as_image, save_doas
 
 import hydra
 
@@ -27,31 +28,32 @@ class DOAMAMBA(pl.LightningModule):
             ResidualBlock(cfg)
             for _ in range(cfg.num_layers)
         ])
+        self.hidden = nn.Linear(cfg.input_dim, cfg.input_dim)
 
         self.doa = nn.Linear(cfg.input_dim, cfg.input_dim, bias=False)
 
-        self.logvar = nn.Conv2d(1, 1, kernel_size=7, padding=3)
+        # self.logvar = nn.Conv2d(1, 1, kernel_size=7, padding=3)
 
     def forward(self, x):
         x = self.channel_encoder(x).squeeze()
 
         for layer in self.mamba_layers:
             x = torch.tanh(layer(x))
+        x_hat = F.relu(self.hidden(x))
+        doa = F.silu(self.doa(x_hat))
+        # logvar = F.silu(self.logvar(doa.unsqueeze(1)).squeeze(1))
 
-        doa = F.silu(self.doa(x))
-        logvar = F.silu(self.logvar(doa.unsqueeze(1)).squeeze(1))
-
-        return doa, logvar
+        return doa
     
     def unwrap_angle(self, angle):
         return angle % (2 * torch.pi)
 
     def accuracy(self, est, gt, var):
-        return torch.sum(torch.abs(est - gt) < var.sqrt()) / torch.numel(est)
+        return torch.sum(torch.abs(est - gt) < var) / torch.numel(est)
     
-    def loss(self, doa, logvar, labels):
+    def loss(self, doa, labels):
         mae = F.l1_loss(doa[~labels.isnan()], labels[~labels.isnan()])
-        l1_loss = (1/(logvar.exp()) * mae + logvar)
+        l1_loss = mae.mean()
         # ways to improve loss:
         #
         # instead of adding logvar add logvar[~labels.isnan()] + [labels.isnan()]
@@ -63,29 +65,29 @@ class DOAMAMBA(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         spectrum, labels = batch
         # spectrum = self.batch_norm(spectrum.float())
-        doa, logvar = self(spectrum)
+        doa = self(spectrum)
         #about loss - maybe the logvar should be more aggresive?
-        train_loss, _ = self.loss(doa, logvar, labels)
+        train_loss, _ = self.loss(doa, labels)
         self.log("train_loss", train_loss.mean(), on_step=True, on_epoch=True, sync_dist=True)
         return train_loss.mean().to(dtype=torch.float32)
 
     def validation_step(self, batch, batch_idx):
         spectrum, labels = batch
         # spectrum = self.batch_norm(spectrum.float())
-        doa, logvar = self(spectrum)
+        doa = self(spectrum)
         if batch_idx==0:
             if (len(unique(labels[1][~labels[1].isnan()].cpu())) > 1):
                 save_sample_as_image(labels[1], labels[1], 'example_gt.png')
                 save_sample_as_image(doa[1], labels[1],'DOA_example.png')
-                save_sample_as_image(logvar[1].exp(), labels[1], 'logvar_example.png')
+                # save_sample_as_image(logvar[1].exp(), labels[1], 'logvar_example.png')
                 save_doas(doa[1], labels[1], 'doa_distribiution.png')
-        val_loss, mae = self.loss(doa, logvar, labels)
-        acc = self.accuracy(doa, labels, logvar.exp())
+        val_loss, mae = self.loss(doa, labels)
+        acc = self.accuracy(doa, labels, deg2rad(1))
         
         self.log("validation_loss", val_loss.mean(), on_step=True, on_epoch=True, sync_dist=True)
         self.log("validation_accuracy", acc.mean(), on_step=True, on_epoch=True, sync_dist=True)
-        self.log("mean_std_over_speakers", logvar.exp()[~labels.isnan()].mean(), on_step=True, on_epoch=True, sync_dist=True)
-        self.log("mean_std_over_noise", logvar.exp()[labels.isnan()].mean(), on_step=True, on_epoch=True, sync_dist=True)
+        # self.log("mean_std_over_speakers", logvar.exp()[~labels.isnan()].mean(), on_step=True, on_epoch=True, sync_dist=True)
+        # self.log("mean_std_over_noise", logvar.exp()[labels.isnan()].mean(), on_step=True, on_epoch=True, sync_dist=True)
         self.log("mean_MAE_over_speakers", mae.mean(), on_step=True, on_epoch=True, sync_dist=True)
 
         return {"val_loss": val_loss.mean(), "val_acc": acc.mean()}
@@ -124,8 +126,7 @@ def main(cfg):
     dirpath="./models/",  # Directory where the model is saved
     filename="best-acc-checkpoint-{epoch:02d}-{validation_accuracy_epoch:.2f}",
     save_top_k=2,  # Save only the best model
-    mode="max",  # "min" for loss, "max" for accuracy/metrics
-    save_last=True  # Save the last checkpoint
+    mode="max"  # "min" for loss, "max" for accuracy/metrics
     )
 
 
@@ -133,45 +134,13 @@ def main(cfg):
         logger=logger,
         max_epochs=cfg.epochs,
         accelerator="cuda" if torch.cuda.is_available() else "cpu",  
-        devices=[0, 1, 2] if torch.cuda.is_available() else 0,
+        devices=[3, 4, 5] if torch.cuda.is_available() else 0,
         strategy='ddp',
         sync_batchnorm=True,
         callbacks=[checkpoint_loss_callback, checkpoint_acc_callback]
     )
 
     trainer.fit(model, train_loader, val_loader)
-
-def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
-    # Ensure tensor is on CPU and detach if it's a computation graph tensor
-    if tensor.is_cuda:
-        tensor = tensor.cpu()
-    tensor = tensor.detach()
-
-    plt.figure()
-    plt.imshow(tensor.numpy().T, origin='lower')
-    plt.axis("off")
-    plt.colorbar()
-
-    plt.title(f'{str(unique(label[~label.isnan()].cpu()))}', fontsize=14, fontweight="bold")
-
-    # Save the image
-    plt.savefig(path + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
-    plt.close()
-
-def save_doas(tensor: torch.Tensor, label: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
-    # Ensure tensor is on CPU and detach if it's a computation graph tensor
-    if tensor.is_cuda:
-        tensor = tensor.cpu()
-    tensor = tensor.detach()
-
-    plt.figure()
-    plt.hist(tensor.numpy(), bins=20)
-
-    plt.title(f'{str(unique(label[~label.isnan()].cpu()))}', fontsize=14, fontweight="bold")
-
-    # Save the image
-    plt.savefig(path + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
-    plt.close()
 
 if __name__ == "__main__":
     main()

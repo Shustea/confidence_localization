@@ -44,3 +44,5 @@ res_alpha : 0.1
 lr : 1e-3
 weight_decay: 1e-5
 epochs: 100
+
+classification : False

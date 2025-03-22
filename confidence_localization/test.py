@@ -45,37 +45,4 @@ def main(cfg):
                 save_doas(doa[1], labels[1], 'test_doa_distribiution.png')
 
 def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
-    # Ensure tensor is on CPU and detach if it's a computation graph tensor
-    if tensor.is_cuda:
-        tensor = tensor.cpu()
-    tensor = tensor.detach()
-
-    plt.figure()
-    plt.imshow(tensor.numpy().T, origin='lower')
-    plt.axis("off")
-    plt.colorbar()
-
-    plt.title(f'{str(unique(label[~label.isnan()].cpu()))}', fontsize=14, fontweight="bold")
-
-    # Save the image
-    plt.savefig(path + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
-    plt.close()
-
-def save_doas(tensor: torch.Tensor, label: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
-    # Ensure tensor is on CPU and detach if it's a computation graph tensor
-    if tensor.is_cuda:
-        tensor = tensor.cpu()
-    tensor = tensor.detach()
-
-    plt.figure()
-    plt.hist(tensor.numpy(), bins=20)
-
-    plt.title(f'{str(unique(label[~label.isnan()].cpu()))}', fontsize=14, fontweight="bold")
-
-    # Save the image
-    plt.savefig(path + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
-    plt.close()
-
-if __name__ == "__main__":
-    main()
-
+    # Ensure tensor is on CPU and detach i
