@@ -8,15 +8,16 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from model import *
 from torchvision import transforms
 import matplotlib.pyplot as plt
-from confidence_localization.util import save_sample_as_image, save_doas
 
 import hydra
 
 import os
 import sys
+sys.path.append(os.getcwd() + '/confidence_localization')
 sys.path.append(os.getcwd() + '/data')
 
 import confidence_localization_dataloader as cld
+from util import save_sample_as_image, save_doas
 
 class DOAMAMBA(pl.LightningModule):
     def __init__(self, cfg):
@@ -134,7 +135,7 @@ def main(cfg):
         logger=logger,
         max_epochs=cfg.epochs,
         accelerator="cuda" if torch.cuda.is_available() else "cpu",  
-        devices=[3, 4, 5] if torch.cuda.is_available() else 0,
+        devices=[5, 6, 7] if torch.cuda.is_available() else 0,
         strategy='ddp',
         sync_batchnorm=True,
         callbacks=[checkpoint_loss_callback, checkpoint_acc_callback]
