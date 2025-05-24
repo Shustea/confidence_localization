@@ -18,7 +18,7 @@ import sys
 sys.path.append(os.getcwd() + '/data')
 sys.path.append(os.getcwd() + '/confidence_localization')
 
-import confidence_localization_dataloadernou786iy57 u64y3tgw2fqed   Cax as cld
+import confidence_localization_dataloader as cld
 from util import save_sample_as_image, save_doas
 
         
@@ -34,7 +34,7 @@ def main(cfg):
 
     checkpoint_path = '/workspaces/confidence_localization/outputs/2025-03-18/23-07-23/models/best-loss-checkpoint-epoch=79-validation_loss_epoch=0.35.ckpt'
     cl_dict = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(cl_dict['state_dict'])
+    model.load_state_dict(cl_dict['state_dict'], strict=False)
     model.eval()
 
     spectrum, labels = next(iter(val_loader))

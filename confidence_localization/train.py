@@ -17,10 +17,12 @@ import hydra
 
 import os
 import sys
+sys.path.append(os.getcwd() + '/confidence_localization')
 sys.path.append(os.getcwd() + '/data')
 sys.path.append(os.getcwd() + '/confidence_localization')
 
 import confidence_localization_dataloader as cld
+from util import save_sample_as_image, save_doas
 from util import save_sample_as_image, save_doas
 
 class DOAMAMBA(pl.LightningModule):
