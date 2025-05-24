@@ -6,16 +6,19 @@ from torchvision.models import densenet121
 from einops import rearrange, repeat, einsum
 
 class ChannelCNN(nn.Module):
-    def __init__(self, receivers_num=4):
+    def __init__(self, receivers_num=4, out_channels=1):
         super(ChannelCNN, self).__init__()
         self.channel_conv = nn.Sequential(
-        nn.Conv2d(2*(receivers_num - 1), (receivers_num - 1), 2*(receivers_num - 1)-1, padding=2),
+        nn.Conv2d(receivers_num - 1, 32, kernel_size=(3,3), padding=1),
+        nn.BatchNorm2d(32),
         nn.ReLU(),
-        nn.Conv2d((receivers_num - 1), 1, (receivers_num - 1), padding=1)
+        nn.Conv2d(32, out_channels, kernel_size=(3,3), padding=1),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU()
         )
 
     def forward(self, x):
-        return self.channel_conv(x.permute(0,1,-1,-2)).squeeze(1)
+        return self.channel_conv(x).squeeze(1).permute(0, 2, 1)
 
 class MambaBlock(nn.Module):
     def __init__(self, input_dim, hidden_dim, receivers_num):
@@ -118,7 +121,7 @@ def complex_log(input, eps=1e-12):
 def selective_scan(u, dt, A, B, C, D, mode='cumsum'):
     dA = torch.einsum('bld,dn->bldn', dt, A)
     dB_u = torch.einsum('bld,bln,bln->bldn', dt, u, B)
-    dA = dA.clamp(min=-20)
+    # dA = dA.clamp(min=-20)
     
     padding =  (0, 0, 0, 0, 1, 0)
 

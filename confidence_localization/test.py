@@ -14,9 +14,12 @@ import hydra
 
 import os
 import sys
-sys.path.append(os.getcwd() + '/data')
 
-import confidence_localization_dataloader as cld
+sys.path.append(os.getcwd() + '/data')
+sys.path.append(os.getcwd() + '/confidence_localization')
+
+import confidence_localization_dataloadernou786iy57 u64y3tgw2fqed   Cax as cld
+from util import save_sample_as_image, save_doas
 
         
 
@@ -29,20 +32,23 @@ def main(cfg):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    checkpoint_path = '/workspaces/unconditional_conditional_VAE/models/last-v4.ckpt'
+    checkpoint_path = '/workspaces/confidence_localization/outputs/2025-03-18/23-07-23/models/best-loss-checkpoint-epoch=79-validation_loss_epoch=0.35.ckpt'
     cl_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(cl_dict['state_dict'])
     model.eval()
 
     spectrum, labels = next(iter(val_loader))
 
+    idx = 2
+
     with torch.no_grad():
         doa, logvar = model.forward(spectrum)
-        if (len(unique(labels[1][~labels[1].isnan()].cpu())) > 1):
-                save_sample_as_image(labels[1], labels[1], 'test_gt.png')
-                save_sample_as_image(doa[1], labels[1],'DOA_test.png')
-                save_sample_as_image(logvar[1].exp(), labels[1], 'logvar_test.png')
-                save_doas(doa[1], labels[1], 'test_doa_distribiution.png')
+    save_sample_as_image(labels[idx], labels[idx], 'test_gt.png')
+    save_sample_as_image(doa[idx], labels[idx],'DOA_test.png')
+    save_sample_as_image(logvar[idx].exp(), labels[idx], 'logvar_test.png')
+    save_doas(doa[idx], labels[idx], 'test_doa_distribiution.png')
 
-def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
-    # Ensure tensor is on CPU and detach i
+    print('---finshed test---')
+
+if __name__ == "__main__":
+    main()

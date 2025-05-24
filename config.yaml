@@ -9,7 +9,7 @@ wav_path: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
 log_dir: "/workspaces/confidence_localization/logs/DOAMAMBA"
 save_dir: "/workspaces/confidence_localization/models/"
 
-batch_size: 4
+batch_size: 128
 num_workers: 4
 
 preprocessed_data_flag : True
@@ -37,12 +37,15 @@ overlap : 0.75
 eps: 1e-6
 
 input_dim : 257
-hidden_dim : 512 #supposed to be 2048
-num_layers : 3
+hidden_dim : 16 #supposed to be 2048
+conv_dim : 4
+expand : 2
+num_layers : 16
 res_alpha : 0.1
 
-lr : 1e-3
-weight_decay: 1e-5
-epochs: 100
+lr : 1e-4
+weight_decay: 1e-6
+epochs: 1000
 
 classification : False
+logvar_confidence_on_noise: False
