@@ -6,19 +6,24 @@ from torchvision.models import densenet121
 from einops import rearrange, repeat, einsum
 
 class ChannelCNN(nn.Module):
-    def __init__(self, receivers_num=4, out_channels=1):
+    def __init__(self, receivers_num=9, out_channels=1):
         super(ChannelCNN, self).__init__()
-        self.channel_conv = nn.Sequential(
-        nn.Conv2d(receivers_num - 1, 32, kernel_size=(3,3), padding=1),
-        nn.BatchNorm2d(32),
-        nn.ReLU(),
-        nn.Conv2d(32, out_channels, kernel_size=(3,3), padding=1),
-        nn.BatchNorm2d(out_channels),
-        nn.ReLU()
-        )
+        channel_num = 2 * (receivers_num - 1)
 
+        self.channel_conv = nn.Sequential(
+            nn.Conv2d(channel_num, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, out_channels, kernel_size=1)  # output_dim = 2 for cos/sin or >1 for classes
+        )
     def forward(self, x):
-        return self.channel_conv(x).squeeze(1).permute(0, 2, 1)
+        return self.channel_conv(x).permute(0, -2, -1 ,1)
 
 class MambaBlock(nn.Module):
     def __init__(self, input_dim, hidden_dim, receivers_num):

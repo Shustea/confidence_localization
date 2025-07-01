@@ -1,34 +1,49 @@
 train_path: "/workspaces/confidence_localization/data/processed/train/"
 val_path: "/workspaces/confidence_localization/data/processed/validation/"
 test_path: "/workspaces/confidence_localization/data/processed/test/"
-interim_train_path: "/workspaces/confidence_localization/data/interim/train/"
-interim_val_path: "/workspaces/confidence_localization/data/interim/validation/"
-interim_test_path: "/workspaces/confidence_localization/data/interim/test/"
+rir_bank_path: "/workspaces/confidence_localization/data/interim/rir_bank/"
 target_path: "/workspaces/confidence_localization/data/processed/target/"
 wav_path: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
 log_dir: "/workspaces/confidence_localization/logs/DOAMAMBA"
 save_dir: "/workspaces/confidence_localization/models/"
 
-batch_size: 128
+train_size : 5000
+val_size : 1000
+
+batch_size: 16
 num_workers: 4
 
 preprocessed_data_flag : True
 
+num_noise_sources : 6
+
 delete_all_samples_flag: False
 sample_length_secs: 5
-room_dim: [3, 3, 3]
+possible_distances: [0.9, 1, 1.1]
+possible_heights: [1.65, 1.675, 1.7, 1.725]
+# possible_heights: [1.65, 1.675, 1.7, 1.725, 1.75, 1.775, 1.8, 1.825, 1.85]
+# possible_heights: [1.75]
+room_dim: [5, 5, 2.5]
 receivers_coords:
-  - [1.5, 1.5, 1.5]
-  - [1.4, 1.641, 1.5]
-  - [1.45, 1.55, 1.5]
-  - [1.55, 1.55, 1.5]
+  - [1.500, 1.500, 0.750]
+  - [1.525, 1.500, 0.750]
+  - [1.518, 1.518, 0.750]
+  - [1.500, 1.525, 0.750] 
+  - [1.482, 1.518, 0.750]   
+  - [1.475, 1.500, 0.750]   
+  - [1.482, 1.482, 0.750]   
+  - [1.500, 1.475, 0.750]   
+  - [1.518, 1.482, 0.750]
+src_height : 1.75
+
 sound_velocity: 340
-reverberation_time: 0.16
+T60: 0.16
 nsample: 4096
 p_silence: 0.0
 p_one: 0.6
+p_movement : 0.5
 
-recivers_num : 4
+recivers_num : 9
 
 fs: 16000
 win_len : 512
@@ -37,15 +52,21 @@ overlap : 0.75
 eps: 1e-6
 
 input_dim : 257
-hidden_dim : 16 #supposed to be 2048
+d_model : 8
+freq_dim : 257
+time_dim : 626
+hidden_dim : 64 
 conv_dim : 4
 expand : 2
-num_layers : 16
+num_layers : 3
 res_alpha : 0.1
 
 lr : 1e-4
-weight_decay: 1e-6
+weight_decay: 1e-5
 epochs: 1000
 
 classification : False
 logvar_confidence_on_noise: False
+
+ar_coef : 0.9
+ar_order : 1

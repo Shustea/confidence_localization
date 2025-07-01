@@ -1,0 +1,8 @@
+*.pt
+*.wav
+*.zip
+*.tar
+data/processed
+data/raw
+__pycache__/
+*.log
