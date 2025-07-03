@@ -11,6 +11,8 @@ sys.path.append('./confidence_localization/util')
 
 from util import compute_multichannel_stft, estimate_rtf
 
+_g_factor_pattern = re.compile(r'-([-\d.]+)_[\d.-]+_[\d.-]+_')
+
 class CLDataset(Dataset):
     def __init__(self, cfg, root_dir, transform=None):
         self.root_dir = root_dir
@@ -37,8 +39,8 @@ class CLDataset(Dataset):
         # ]
         # rtf = torch.stack(rtf, dim=-1)
 
-        rtf = rtf / (rtf.abs() + 1e-8)
-        rtf = (rtf - rtf.mean()) / rtf.std()
+        # rtf = rtf / (rtf.abs() + 1e-8)
+        rtf = (rtf - rtf.mean(0)) / (rtf.std(0) + 1e-6)
 
         if self.transform:
             rtf = self.transform(rtf)
@@ -63,13 +65,17 @@ def estimate_prtf(spectrums, win_len=4):
     return rtf
 
 def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
+    all_spectra = []
     energy_factor = 0 if classification else 0.2
-    labels = torch.full(spectrum_shape_tuple, torch.nan)
 
     speakers = list(reversed(get_speakers_from_path(path[:-3])))
+
+    F, T = spectrum_shape_tuple
+
+    labels = torch.full((cfg.max_num_of_speakers, F, T), torch.nan)
+
     doas = torch.tensor(list(reversed(get_speaker_doa_from_path(path[:-3])[:len(speakers)])))
     g = list(reversed(get_g_factor_from_path(path[:-3])))
-    max_energy = torch.zeros(spectrum_shape_tuple)
 
     for speaker_idx, speaker in enumerate(speakers):
         file_path = os.path.join(cfg.wav_path, speaker[:3], f"{speaker}.wav")
@@ -97,14 +103,23 @@ def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
             signal = float(g[speaker_idx]) * signal
 
         original_spectrum = torch.stft(torch.from_numpy(signal), n_fft=cfg.win_len, hop_length=int(cfg.win_len * (1 - cfg.overlap)), return_complex=True).abs()
-        mask = original_spectrum >= (energy_factor * torch.median(original_spectrum)) if energy_factor > 0 else torch.full(original_spectrum.shape, True)
+        all_spectra.append(original_spectrum)
 
-        stronger_mask = mask & (original_spectrum > max_energy)
-        speaker_start_end = doas[speaker_idx]
-        labels[stronger_mask] = torch.linspace(speaker_start_end[0], speaker_start_end[1], original_spectrum.shape[-1]).repeat(original_spectrum.shape[-2], 1)[stronger_mask]
-        max_energy[stronger_mask] = original_spectrum[stronger_mask].float()
+    for speaker_idx in range(len(speakers)):
+        spectrum = all_spectra[speaker_idx]
 
-    return torch.remainder(labels.T, 2 * torch.pi)
+        if energy_factor > 0:
+            vad_mask = spectrum >= (energy_factor * torch.median(spectrum))
+        else:
+            vad_mask = torch.ones_like(spectrum, dtype=torch.bool)
+
+        doa_start, doa_end = doas[speaker_idx]
+
+        doa_map = torch.linspace(doa_start, doa_end, spectrum.shape[-1]).repeat(spectrum.shape[-2], 1)
+
+        labels[speaker_idx, vad_mask] = doa_map[vad_mask]
+
+    return torch.remainder(labels.permute(0, 2, 1), 2 * torch.pi)
 
 def get_speaker_positions_from_path(path):
     # Split on hyphens that come after a non-digit/letter (i.e., real separator)
@@ -122,8 +137,12 @@ def get_speaker_positions_from_path(path):
             print(f"Invalid coordinates in: {speaker}")
     return positions
 
-def get_g_factor_from_path(path):
-    return [None if i == 0 else s.split('_')[0] for i, s in enumerate(path.split('-')) if s != 'NONE']
+def get_g_factor_from_path(path: str):
+    g_factor = [None]
+    match = _g_factor_pattern.search(path)
+    if match:
+        g_factor.append(float(match.group(1)))
+    return g_factor
 
 def get_speakers_from_path(path):
     segments = re.split(r'(?<=[a-zA-Z0-9])-(?=[^0-9-])|(?<=[a-zA-Z])-(?=\d)', path[:-3].split('/')[-1])

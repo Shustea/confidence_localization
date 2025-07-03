@@ -17,6 +17,7 @@ preprocessed_data_flag : True
 
 num_noise_sources : 6
 
+max_num_of_speakers : 2
 delete_all_samples_flag: False
 sample_length_secs: 5
 possible_distances: [0.9, 1, 1.1]
@@ -42,6 +43,7 @@ nsample: 4096
 p_silence: 0.0
 p_one: 0.6
 p_movement : 0.5
+dominance_threshold : 0.6
 
 recivers_num : 9
 
@@ -55,7 +57,7 @@ input_dim : 257
 d_model : 8
 freq_dim : 257
 time_dim : 626
-hidden_dim : 64 
+hidden_dim : 32 
 conv_dim : 4
 expand : 2
 num_layers : 3
@@ -70,3 +72,6 @@ logvar_confidence_on_noise: False
 
 ar_coef : 0.9
 ar_order : 1
+
+initial_warmup : 2500
+warmup : 15000

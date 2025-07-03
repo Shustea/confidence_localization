@@ -11,16 +11,10 @@ class ChannelCNN(nn.Module):
         channel_num = 2 * (receivers_num - 1)
 
         self.channel_conv = nn.Sequential(
-            nn.Conv2d(channel_num, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.Conv2d(channel_num, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.Conv2d(32, out_channels, kernel_size=1)  # output_dim = 2 for cos/sin or >1 for classes
+            nn.Conv2d(32, out_channels, kernel_size=1)
         )
     def forward(self, x):
         return self.channel_conv(x).permute(0, -2, -1 ,1)
