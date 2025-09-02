@@ -26,27 +26,54 @@ from util import save_sample_as_image, save_doas
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
 def main(cfg):
     # our_transform = transforms.Normalize(mean=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2], std=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2])
-    val_loader = cld.get_dataloader(cfg, cfg.val_path, cfg.interim_val_path)
+    val_loader = cld.get_dataloader(cfg, cfg.val_path)
 
     model = DOAMAMBA(cfg)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
 
-    checkpoint_path = '/workspaces/confidence_localization/outputs/2025-03-18/23-07-23/models/best-loss-checkpoint-epoch=79-validation_loss_epoch=0.35.ckpt'
+    checkpoint_path = '/workspaces/confidence_localization/outputs/2025-07-07/21-26-20/models/best-loss-checkpoint-epoch=73-validation_loss_epoch=0.00.ckpt'
     cl_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(cl_dict['state_dict'], strict=False)
-    model.eval()
+    model.to(device).eval()
 
-    spectrum, labels = next(iter(val_loader))
+    spectrum, labels, title= next(iter(val_loader))
+    spectrum = spectrum.to(device)
+    labels = labels.to(device)
 
-    idx = 2
+    idx = 1
 
     with torch.no_grad():
-        doa, logvar = model.forward(spectrum)
-    save_sample_as_image(labels[idx], labels[idx], 'test_gt.png')
-    save_sample_as_image(doa[idx], labels[idx],'DOA_test.png')
-    save_sample_as_image(logvar[idx].exp(), labels[idx], 'logvar_test.png')
-    save_doas(doa[idx], labels[idx], 'test_doa_distribiution.png')
+        doa_unit, log_std = model.forward(spectrum)
+        
+    log_std = log_std[idx].squeeze(-1)
+    std     = log_std.exp()
+    doa     = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
+    doa = doa[idx]
+    
+    acc_map = model.circ_error(doa - labels[idx]) < std
+
+    spk_idx = torch.argmax(acc_map.sum((1,2)))
+    angle_diff = model.circ_error(doa - labels[idx, spk_idx])
+
+    print(f' -  - - - - -- - - - -- - - -- -- - - - - -- - -')
+    print(f'acc @ {(acc_map[spk_idx][~torch.isnan(acc_map[spk_idx])]).sum() / (~torch.isnan(acc_map[spk_idx])).sum()}')
+    print(f'mean error @ {torch.rad2deg(angle_diff[~torch.isnan(angle_diff)].mean())}')
+    print(f'20th quantile error @ {torch.rad2deg(angle_diff[~torch.isnan(angle_diff)].quantile(0.2))}')
+    print(f'50th quantile error @ {torch.rad2deg(angle_diff[~torch.isnan(angle_diff)].quantile(0.5))}')
+    print(f'70th quantile error @ {torch.rad2deg(angle_diff[~torch.isnan(angle_diff)].quantile(0.7))}')
+    print(f'90th quantile error @ {torch.rad2deg(angle_diff[~torch.isnan(angle_diff)].quantile(0.9))}')
+    print(f'95th quantile error @ {torch.rad2deg(angle_diff[~torch.isnan(angle_diff)].quantile(0.95))}')
+    print(f' - --- - - -  - - -- - -- -- - - -- - -- - - - -')
+
+    lbl_1 = labels[idx, spk_idx]
+    if lbl_1.numel() and lbl_1[~lbl_1.isnan()].unique().numel() > 1:
+        save_sample_as_image(doa.cpu(), lbl_1.cpu(), title[idx], "test_DOA.png")
+        save_sample_as_image(std.cpu(), lbl_1.cpu(), title[idx], "test_std.png")
+        save_sample_as_image(acc_map[spk_idx].cpu(), lbl_1.cpu(), title[idx], "test_acc.png")
+        save_sample_as_image(acc_map[spk_idx].cpu(), lbl_1.cpu(), title[idx], "test_acc.png")
+        save_sample_as_image(angle_diff.cpu(), lbl_1.cpu(), title[idx], "test_error.png")
+
 
     print('---finshed test---')
 

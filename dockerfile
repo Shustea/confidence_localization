@@ -10,13 +10,15 @@ RUN chown -R shustea:shustea /workspace
 # Switch to root to install system dependencies
 USER root
 
-# Install system dependencies
+# Install system dependencies (added git + tmux)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
     g++ \
     python3-dev \
     libffi-dev \
+    git \
+    tmux \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Set environment variable for CUDA
@@ -30,7 +32,7 @@ COPY --chown=shustea:shustea . .
 
 # Upgrade pip and install Python dependencies
 RUN pip install --upgrade pip setuptools wheel
-RUN pip install --no-cache-dir --no-build-isolation mamba-ssm[causal-conv1d]==2.2.2
+RUN pip install --no-cache-dir mamba-ssm[causal-conv1d]==2.2.2
 
-# Default command
-CMD ["python", "./confidence_localization/confidence_localization/train.py"]
+# Start with bash
+CMD [ "bash" ]

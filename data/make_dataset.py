@@ -143,7 +143,7 @@ def sanity_check_gevd(args):
 
 
 def create_rir_bank(cfg):
-    torch.cuda.set_device(3)
+    torch.cuda.set_device(7)
     rir_bank_path = cfg.rir_bank_path
 
     room_dim = cfg.room_dim

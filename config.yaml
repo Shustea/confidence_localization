@@ -7,10 +7,12 @@ wav_path: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
 log_dir: "/workspaces/confidence_localization/logs/DOAMAMBA"
 save_dir: "/workspaces/confidence_localization/models/"
 
+# resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2025-07-07/21-26-20/models/best-loss-checkpoint-epoch=73-validation_loss_epoch=0.00.ckpt"
+
 train_size : 5000
 val_size : 1000
 
-batch_size: 16
+batch_size: 6
 num_workers: 4
 
 preprocessed_data_flag : True
@@ -54,14 +56,15 @@ overlap : 0.75
 eps: 1e-6
 
 input_dim : 257
-d_model : 8
+d_model : 16
 freq_dim : 257
 time_dim : 626
-hidden_dim : 32 
+hidden_dim : 64
 conv_dim : 4
 expand : 2
-num_layers : 3
+num_layers : 4
 res_alpha : 0.1
+log_var_weight : 1
 
 lr : 1e-4
 weight_decay: 1e-5
@@ -73,5 +76,7 @@ logvar_confidence_on_noise: False
 ar_coef : 0.9
 ar_order : 1
 
-initial_warmup : 2500
-warmup : 15000
+initial_warmup : 0
+warmup : 100
+
+noise_beta : 0.2

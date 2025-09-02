@@ -66,13 +66,13 @@ def estimate_prtf(spectrums, win_len=4):
 
 def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
     all_spectra = []
-    energy_factor = 0 if classification else 0.2
+    energy_factor = 0 if classification else 0
 
     speakers = list(reversed(get_speakers_from_path(path[:-3])))
 
     F, T = spectrum_shape_tuple
 
-    labels = torch.full((cfg.max_num_of_speakers, F, T), torch.nan)
+    labels = torch.full((cfg.max_num_of_speakers, T), torch.nan)
 
     doas = torch.tensor(list(reversed(get_speaker_doa_from_path(path[:-3])[:len(speakers)])))
     g = list(reversed(get_g_factor_from_path(path[:-3])))
@@ -102,24 +102,17 @@ def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
         if speaker_idx > 0 and g[speaker_idx] is not None:
             signal = float(g[speaker_idx]) * signal
 
-        original_spectrum = torch.stft(torch.from_numpy(signal), n_fft=cfg.win_len, hop_length=int(cfg.win_len * (1 - cfg.overlap)), return_complex=True).abs()
-        all_spectra.append(original_spectrum)
+        signal_power = torch.tensor(signal**2)
+        all_spectra.append(signal_power)
 
     for speaker_idx in range(len(speakers)):
-        spectrum = all_spectra[speaker_idx]
-
-        if energy_factor > 0:
-            vad_mask = spectrum >= (energy_factor * torch.median(spectrum))
-        else:
-            vad_mask = torch.ones_like(spectrum, dtype=torch.bool)
-
         doa_start, doa_end = doas[speaker_idx]
 
-        doa_map = torch.linspace(doa_start, doa_end, spectrum.shape[-1]).repeat(spectrum.shape[-2], 1)
+        doa_map = torch.linspace(doa_start, doa_end, labels.shape[1]) # Since we assume uniform speed in the simulation
 
-        labels[speaker_idx, vad_mask] = doa_map[vad_mask]
+        labels[speaker_idx] = doa_map
 
-    return torch.remainder(labels.permute(0, 2, 1), 2 * torch.pi)
+    return torch.remainder(labels, 2 * torch.pi)
 
 def get_speaker_positions_from_path(path):
     # Split on hyphens that come after a non-digit/letter (i.e., real separator)
