@@ -1,5 +1,6 @@
 import os
 import torch
+import math
 from numpy import isnan, zeros, concatenate
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.functional import one_hot
@@ -12,6 +13,7 @@ sys.path.append('./confidence_localization/util')
 from util import compute_multichannel_stft, estimate_rtf
 
 _g_factor_pattern = re.compile(r'-([-\d.]+)_[\d.-]+_[\d.-]+_')
+pi = math.pi
 
 class CLDataset(Dataset):
     def __init__(self, cfg, root_dir, transform=None):
@@ -19,6 +21,7 @@ class CLDataset(Dataset):
         self.sample_rate = cfg.fs
         self.cfg = cfg
         self.transform = transform
+        self.T60 = cfg.T60
         self.classification = cfg.classification
         self.sample_files = [os.path.join(root_dir, f) for f in os.listdir(root_dir) if f.endswith('.pt')]
 
@@ -33,20 +36,17 @@ class CLDataset(Dataset):
         
         labels = assign_gt_to_tf_bin(self.cfg, rtf[0].shape, sample_name, self.classification)
         
-        # rtf = [
-        #     rtf[i] + 1j * rtf[i + 1]
-        #     for i in range(0, rtf.shape[0], 2)
-        # ]
-        # rtf = torch.stack(rtf, dim=-1)
-
-        # rtf = rtf / (rtf.abs() + 1e-8)
-        rtf = (rtf - rtf.mean(0)) / (rtf.std(0) + 1e-6)
+        rtf = (rtf - rtf.mean(1).unsqueeze(1)) / (rtf.std(1).unsqueeze(1) + 1e-6) # Normalize over F
 
         if self.transform:
             rtf = self.transform(rtf)
 
         return rtf, labels, str(title)[8:-2]
 
+# def normalize_data(rtf, cfg):
+#     if cfg.data_standardization == "minmax":
+#         return rtf / (rtf.max() - rtf.min())
+ 
 def estimate_prtf(spectrums, win_len=4):
     M, F, T = spectrums.shape
     rtf_complex = torch.zeros((M-1, F, T), dtype=torch.complex64)
@@ -112,22 +112,20 @@ def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
 
         labels[speaker_idx] = doa_map
 
-    return torch.remainder(labels, 2 * torch.pi)
+    return torch.remainder(labels + pi, 2 * pi) - pi
 
 def get_speaker_positions_from_path(path):
     # Split on hyphens that come after a non-digit/letter (i.e., real separator)
-    segments = re.split(r'(?<=[a-zA-Z0-9])-(?=[^0-9-])|(?<=[a-zA-Z])-(?=\d)', path[:-3].split('/')[-1])
+    segments = re.findall(r'(-?\d+(?:\.\d+)?)_(-?\d+(?:\.\d+)?)_(-?\d+(?:\.\d+)?)_', path.split('/')[-1])
+    
     positions = []
-    for i, speaker in enumerate(segments):
-        if speaker == 'NONE':
-            continue
-        parts = speaker.strip('#').split('_')
-        coords = parts[:3] if i == 0 else parts[1:4]
+    for m in segments:
         try:
-            coords = [float(c) for c in coords]
+            coords = [float(x) for x in m]
             positions.append(coords)
         except ValueError:
-            print(f"Invalid coordinates in: {speaker}")
+            print(f"Invalid coordinates found: {m}")
+    
     return positions
 
 def get_g_factor_from_path(path: str):
@@ -138,18 +136,11 @@ def get_g_factor_from_path(path: str):
     return g_factor
 
 def get_speakers_from_path(path):
-    segments = re.split(r'(?<=[a-zA-Z0-9])-(?=[^0-9-])|(?<=[a-zA-Z])-(?=\d)', path[:-3].split('/')[-1])
-    speakers = []
-    for s in segments:
-        if s == 'NONE':
-            continue
-        parts = s.strip('#').split('_')
-        speakers.append(parts[-1])
-    return speakers
+    return re.findall(r'(?<=_)\d+[a-z][a-z0-9]+(?=[-_])', path.split('/')[-1])
 
 def get_speaker_doa_from_path(path):
     return [tuple(float(s) for s in p[:2]) for p in get_speaker_positions_from_path(path)]
 
 def get_dataloader(cfg, root_dir, shuffle=False, transform=None):
     dataset = CLDataset(cfg, root_dir, transform=transform)
-    return DataLoader(dataset, batch_size=cfg.batch_size, shuffle=shuffle, num_workers=cfg.num_workers, pin_memory=True)
+    return DataLoader(dataset, batch_size=cfg.batch_size, shuffle=shuffle, num_workers=cfg.num_workers, pin_memory=True, persistent_workers=False)

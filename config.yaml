@@ -7,12 +7,14 @@ wav_path: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
 log_dir: "/workspaces/confidence_localization/logs/DOAMAMBA"
 save_dir: "/workspaces/confidence_localization/models/"
 
+default_gpu : 7
+
 # resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2025-07-07/21-26-20/models/best-loss-checkpoint-epoch=73-validation_loss_epoch=0.00.ckpt"
 
-train_size : 5000
-val_size : 1000
+train_size : 5400
+val_size : 600
 
-batch_size: 6
+batch_size: 8
 num_workers: 4
 
 preprocessed_data_flag : True
@@ -22,8 +24,7 @@ num_noise_sources : 6
 max_num_of_speakers : 2
 delete_all_samples_flag: False
 sample_length_secs: 5
-possible_distances: [0.9, 1, 1.1]
-possible_heights: [1.65, 1.675, 1.7, 1.725]
+min_sep : 25
 # possible_heights: [1.65, 1.675, 1.7, 1.725, 1.75, 1.775, 1.8, 1.825, 1.85]
 # possible_heights: [1.75]
 room_dim: [5, 5, 2.5]
@@ -40,12 +41,14 @@ receivers_coords:
 src_height : 1.75
 
 sound_velocity: 340
-T60: 0.16
+T60: 0.36
 nsample: 4096
 p_silence: 0.0
 p_one: 0.6
 p_movement : 0.5
 dominance_threshold : 0.6
+min_overlap : 0.3
+max_overlap : 0.9
 
 recivers_num : 9
 
@@ -61,22 +64,26 @@ freq_dim : 257
 time_dim : 626
 hidden_dim : 64
 conv_dim : 4
-expand : 2
-num_layers : 4
+layers : [2, 2, 4, 4]
 res_alpha : 0.1
 log_var_weight : 1
 
-lr : 1e-4
+lr : 1e-3
 weight_decay: 1e-5
 epochs: 1000
+regularization_constant : 1e-6
 
 classification : False
 logvar_confidence_on_noise: False
+# nnl_func : 'von_mises'
+nnl_func : 'gaussian'
+error_bound_on_mse : 180
+
 
 ar_coef : 0.9
 ar_order : 1
 
 initial_warmup : 0
-warmup : 100
+warmup : 300
 
-noise_beta : 0.2
+noise_beta : 0

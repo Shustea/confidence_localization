@@ -39,11 +39,23 @@ def mix_signal(args):
     for _ in range(args.num_noise_sources):
         mixed_signal, _ = add_noise(mixed_signal, args, beta)
 
-    mix_id = f"{first_file_id}-{second_file_id}_{args.num_noise_sources}#"
+    mix_id = f"{first_file_id}-{second_file_id}_T60-{int(1000*args.T60)}ms_{args.num_noise_sources}#"
     return mixed_signal, mix_id
 
 def get_speaker_dirs(wav_path):
     return [d for d in os.listdir(wav_path) if os.path.isdir(os.path.join(wav_path, d))]
+
+def sample_non_overlapping_doa(first_doa, min_sep=np.deg2rad(25), max_iter=100):
+    for _ in range(max_iter):
+        doa = np.random.uniform(0, 2 * np.pi)
+        if np.abs(np.angle(np.exp(1j*(doa - first_doa)))) > min_sep:
+            return doa
+
+def choose_start_offset(sample_length, min_overlap=0.3, max_overlap=0.7):
+    # force overlap only for part of the utterance
+    overlap_fraction = np.random.uniform(min_overlap, max_overlap)
+    max_start = int(sample_length * (1 - overlap_fraction))
+    return np.random.randint(0, max_start)
 
 def generate_speaker_sample(args, speakers_dirs, beta):
     sample_length = int(args.sample_length_secs * args.fs)
@@ -52,9 +64,9 @@ def generate_speaker_sample(args, speakers_dirs, beta):
     file_id = np.random.choice(os.listdir(os.path.join(args.wav_path, speaker_id)))
     audio, _ = librosa.load(os.path.join(args.wav_path, speaker_id, file_id), sr=args.fs)
 
-    doa, dist = np.random.uniform(0, 2 * np.pi), np.random.uniform(0.9, 1.1)
+    doa, dist = np.random.uniform(0, 2 * np.pi), np.random.uniform(0.8, 1)
     start_pos = np.array([1.5 + dist * np.cos(doa), 1.5 + dist * np.sin(doa), np.random.uniform(1.65, 1.85)])
-    angular_speed = np.random.normal(0.2, 0.05)
+    angular_speed = np.random.uniform(-1, 1)
     sample = apply_rir_on_sample(audio, args, start_pos, dist, angular_speed, sample_length, beta)
     sample = pad_or_trim(sample, sample_length)
 
@@ -76,13 +88,13 @@ def generate_second_speaker_sample(args, speakers_dirs, first_id, first_sample, 
     gain = np.sqrt(10 ** (-snr / 10) * (np.std(first_sample) / np.std(audio)) ** 2)
     audio *= gain
 
-    doa, dist = np.random.uniform(0, 2 * np.pi), np.random.uniform(0.9, 1.1)
-    angular_speed = np.random.normal(0.2, 0.05)
+    doa = sample_non_overlapping_doa(doa_range[0], min_sep=np.deg2rad(args.min_sep))
+    dist = np.random.uniform(1.2, 1.3)
+    angular_speed = np.random.uniform(-1, 1)
     if doa_range[0] < doa < doa_range[1]:
         prob = np.random.rand()
         if prob > 0.5:
             doa = np.random.uniform(0, doa_range[0])
-            angular_speed = -np.abs(angular_speed)
         else:
             doa = np.random.uniform(doa_range[1], 2 * np.pi)
 
@@ -90,7 +102,7 @@ def generate_second_speaker_sample(args, speakers_dirs, first_id, first_sample, 
     raw_sample = apply_rir_on_sample(audio, args, start_pos, dist, angular_speed, sample_length, beta)
 
     sample = np.zeros_like(first_sample)
-    start = np.random.randint(0, sample_length)
+    start = choose_start_offset(sample_length, min_overlap=args.min_overlap, max_overlap=args.max_overlap)
     length = min(sample_length - start, raw_sample.shape[0])
     sample[start:start + length] = raw_sample[:length]
 

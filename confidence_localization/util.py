@@ -4,7 +4,7 @@ import numpy as np
 import torch.nn.functional as F
 from torch.jit import script
 
-def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
+def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch.Tensor, filename: str, title=None, path='/workspaces/confidence_localization/samples/'):
     # Ensure tensor is on CPU and detach if it's a computation graph tensor
     tensor = tensor.squeeze()
     
@@ -19,6 +19,7 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch
     plt.xlabel('Actual DOA [radians]')
     plt.ylabel('Error At Direction [deg]')
     plt.suptitle('Angle error at target DOA')
+    plt.title(title)
     plt.legend()
     plt.grid()
 
@@ -34,6 +35,7 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch
     plt.plot(time_axis, tensor - bound, label='Estimation Bound', color='cyan')
     plt.plot(time_axis, label, label='GT', color='red')
     plt.suptitle('Estimation angle (with bounds) compared to Ground Truth')
+    plt.title(title)
     plt.xlabel('Time [frames]')
     plt.ylabel('Azimuth [radians]')
     plt.legend()
@@ -43,10 +45,11 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch
     plt.close()
 
     plt.figure()
-    plt.plot(time_axis, bound, label='Estimation Bounds', color='black')
+    plt.plot(time_axis, torch.rad2deg(bound), label='Estimation Bounds', color='black')
     plt.suptitle('Estimation bounds compared to time')
+    plt.title(title)
     plt.xlabel('Time [frames]')
-    plt.ylabel('error bound [radians]')
+    plt.ylabel('error bound [degrees]')
     plt.legend()
 
     # Save the image
@@ -72,15 +75,14 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch
 #     plt.close()
 
 @script
-def gevd(Rs: torch.Tensor, Rv: torch.Tensor) -> torch.Tensor:
-    eps = 1e-3 * torch.eye(Rs.shape[0], dtype=Rs.dtype, device=Rs.device)
-    Rv = Rv + eps
+def gevd(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Tensor:
+    Rv += eps * torch.eye(Rs.shape[0], dtype=Rs.dtype, device=Rs.device)
     Rv_inv = torch.linalg.inv(Rv)
     L, U = torch.linalg.eig(Rv_inv @ Rs)
     _, idx = torch.max(L.real, dim=0)
     principal_vec = U[:, idx]
     temp = Rv @ principal_vec
-    return temp[1:] / (temp[0] + 1e-8)
+    return temp[1:] / (temp[0] + eps)
 
 def energy_vad(x, fs, frame_ms=20, hop_ms=10, alpha=4, win_sec=1):
     frame = int(frame_ms*fs/1000)
@@ -137,15 +139,15 @@ def estimate_rtf(spectrums, vad_mask=None, win_len=4):
         thresholds = torch.quantile(energy, 0.1, dim=-1, keepdim=True)
         vad_mask = energy < thresholds  # (F, T)
 
-    rtf = torch.zeros(M - 1, F_bins, T, dtype=torch.complex64, device=spectrums.device)
+    rtf = torch.empty(M - 1, F_bins, T, dtype=torch.complex64, device=spectrums.device)
 
     for f in range(F_bins):
         vad_f = vad_mask[f]  # (T,)
-        if vad_f.sum() < 4:
-            continue
-
-        noise_frames = spectrums[:, f, vad_f]  # (M, T_vad)
-        Rv = estimate_cov_batched(noise_frames)  # (M, M)
+        if vad_f.sum() >= 4:
+            noise_frames = spectrums[:, f, vad_f]           # (M, T_vad)
+            Rv = estimate_cov_batched(noise_frames)         # (M, M)
+        else:
+            Rv = 1e-6 * torch.eye(M, dtype=spectrums.dtype, device=spectrums.device)
 
         padded = F.pad(spectrums[:, f, :], pad=(win_len, win_len), mode='constant', value=0)  # (M, T + 2w)
         Xf = padded.unfold(-1, size=win_size, step=1)  # (M, T, win_size)

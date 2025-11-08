@@ -129,50 +129,51 @@ class DOAMAMBA(pl.LightningModule):
         super(DOAMAMBA, self).__init__()
 
         self.cfg = cfg
+
+        self.negative_log_likelihood_func = [gaussian_loss if cfg.nnl_func == 'gaussian' else von_mises_loss if cfg.nnl_func == 'von_mises' else None][0]
         
         self.mamba_layers = nn.Sequential(*[
-            MambaResCTF(cfg, 2 ** (floor(index / 2) + 1))
-            for index in range(cfg.num_layers)
+            MambaResCTF(cfg, expand)
+            for expand in cfg.layers
         ])
 
         self.hidden = nn.Linear(cfg.d_model, 1)
 
-        self.doa = nn.Linear(cfg.input_dim, 2)
+        self.output_head = nn.Sequential(
+            nn.Linear(cfg.input_dim, cfg.input_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(cfg.input_dim // 2),
+        )
+        
+        self.doa = nn.Linear(cfg.input_dim // 2 , 2)
 
-        self.log_std = nn.Linear(cfg.input_dim, 1)
+        self.log_std = nn.Linear(cfg.input_dim // 2, 1)
+
         
         self.reset_parameters()
 
     def reset_parameters(self):
-    
         init.xavier_uniform_(self.hidden.weight)
         init.zeros_(self.hidden.bias)
 
         init.xavier_uniform_(self.doa.weight)
         init.zeros_(self.doa.bias)
 
-        # init.xavier_uniform_(self.std.weight)
-        # init.zeros_(self.std.bias)
+        init.xavier_uniform_(self.log_std.weight)
+        init.zeros_(self.log_std.bias)
 
     def forward(self, x):
-        # x = (x - x.mean(dim=-1, keepdim=True)) / (x.std(dim=-1, keepdim=True) + 1e-3)
         x = x.permute(0, 2, -1, 1)
         
         for i, block in enumerate(self.mamba_layers):
-            x = block(x)
-            
-            # if i / self.cfg.num_layers == 0.5:
-            #     x = cp.checkpoint(block, x)
-            # else:
-            #     x = block(x)
+            x = block(x.clamp(-10,10))
 
-        x_hat = F.gelu(self.hidden(x).squeeze(-1)).permute(0, 2, 1)  # (B, T, F)
+        x_hat = self.output_head(F.gelu(self.hidden(x).squeeze(-1)).permute(0, 2, 1))  # (B, T, F)
 
-        v = self.doa(x_hat)                                          # (..., 2)
-        doa_unit_vector = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        doa_vec = self.doa(x_hat)                                    
 
         safe_log_std = torch.clamp(self.log_std(x_hat), min=-2.0, max=1.5)
-        return doa_unit_vector, safe_log_std
+        return doa_vec, safe_log_std
     
     def circ_error(self, angle):
         return ((angle + torch.pi) % (2 * torch.pi) - torch.pi).abs()
@@ -183,71 +184,74 @@ class DOAMAMBA(pl.LightningModule):
             var = var[valid]
         return torch.sum(self.circ_error(est[valid] - gt[valid]) < var) / torch.sum(valid)
     
-    def loss(self, doa_vec, log_std, labels, batch_idx):
+    def _sanitize(self, doa_vec, log_std):
         log_std = log_std.squeeze(-1)
-        B, S, T = labels.shape
-        device, dtype = doa_vec.device, doa_vec.dtype
-
-        # sanitize inputs
         doa_vec = torch.nan_to_num(doa_vec, nan=0.0)
         log_std = torch.nan_to_num(log_std, nan=0.0, posinf=1.5, neginf=-4.0)
-        
-        # targets as unit vectors; mask of valid labels 
-        labels_vec = torch.stack((labels.cos(), labels.sin()), dim=-1) # (B,S,T,2)
-        valid_mask = ~labels.isnan() # (B,S,T)
-        
-        # expand pred to compare against all speakers
-        pred = doa_vec.unsqueeze(1).expand(-1, S, -1, -1) # (B,S,T,2)
-         
-        # stable angle between 2D unit vectors: atan2(|u×v|, u·v) 
-        dot = (pred * labels_vec).sum(-1) # (B,S,T)
-        cross = pred[..., 0] * labels_vec[..., 1] - pred[..., 1] * labels_vec[..., 0] # (B,S,T)
-        ang = torch.atan2(cross.abs(), dot.clamp(-1 + 1e-7, 1 - 1e-7)) # (B,S,T)
-        ang = ang.masked_fill(~valid_mask, float('nan')) # choose best speaker using masked mean (no nanmean) 
-        
-        valid_counts = valid_mask.sum(-1) # (B,S) 
-        sum_ang = torch.where(valid_mask, ang, torch.zeros_like(ang)).sum(-1) # (B,S) 
-        mean_ang = torch.where(valid_counts > 0, sum_ang / valid_counts.clamp_min(1), float('inf')) 
-        best_s = mean_ang.argmin(dim=1) # (B,) 
-        best_s_expand = best_s.view(B, 1, 1) # slice chosen target/mask 
-        chosen_mask = valid_mask.gather(1, best_s_expand.expand(-1, 1, T)).squeeze(1) # (B,T) 
-        chosen_tgt = labels_vec.gather(1, best_s_expand.unsqueeze(-1).expand(-1, 1, T, 2)).squeeze(1) # (B,T,2)
+        return doa_vec, log_std
 
-        # flatten and boolean-select 
-        doa_flat = doa_vec.reshape(B, -1, 2) 
-        target_flat = chosen_tgt.reshape(B, -1, 2) 
-        mask_flat = chosen_mask.reshape(B, -1) 
-        logstd_flat = log_std.reshape(B, -1) 
-        sel_pred = doa_flat[mask_flat] # (N_sel, 2) 
-        sel_tgt = target_flat[mask_flat] # (N_sel, 2) 
-        sel_ls = (2 * logstd_flat[mask_flat]).clamp(-8.0, 3.0) # main loss 
-        if sel_pred.numel() == 0:
-            loss_main = doa_vec.sum() * 0.0 
-            mae = torch.tensor(0.0, device=device, dtype=dtype) 
+    def _labels_to_vec(self, labels):
+        valid_mask = ~labels.isnan()
+        labels_vec = torch.stack((labels.cos(), labels.sin()), dim=-1)
+        return labels_vec, valid_mask
+
+    def _angle_metric(self, u, v):
+        d = u - v
+        return 2.0 * torch.asin((d.norm(dim=-1).clamp(0.0, 2.0)) * 0.5)
+
+    def _best_speaker(self, pred_unit, labels_vec, valid_mask):
+        B, S, T, _ = labels_vec.shape
+        pred_exp = pred_unit.unsqueeze(1).expand(-1, S, -1, -1)
+        mean_ang = self._angle_metric(pred_exp, labels_vec).mean(-1)
+        mean_ang[torch.isnan(mean_ang)] = float('inf')
+        best_s = mean_ang.argmin(dim=1)
+        best_s_expand = best_s.view(B, 1, 1)
+        chosen_mask = valid_mask.gather(1, best_s_expand.expand(-1, 1, T)).squeeze(1)
+        chosen_tgt  = labels_vec.gather(1, best_s_expand.unsqueeze(-1).expand(-1, 1, T, 2)).squeeze(1)
+        return best_s, chosen_mask, chosen_tgt
+
+    def _alpha(self):
+        if self.current_epoch < self.cfg.initial_warmup:
+            return 0.0
+        denom = max(1, self.cfg.warmup - self.cfg.initial_warmup)
+        return float(min(1.0, (self.current_epoch - self.cfg.initial_warmup) / denom))
+
+    def _noise_regularizer(self, log_std, chosen_mask, device, dtype):
+        noise_mask = ~chosen_mask
+        noise_logstd = log_std[noise_mask]
+        noise_logstd = noise_logstd[torch.isfinite(noise_logstd)]
+        if noise_logstd.numel():
+            target_min = getattr(self.cfg, "noise_logstd_min", 0.0)
+            return F.relu(target_min - noise_logstd).mean()
+        return torch.tensor(0.0, device=device, dtype=dtype)
+
+    def loss(self, doa_vec, log_std, labels, batch_idx):
+        B, S, T = labels.shape
+        device, dtype = doa_vec.device, doa_vec.dtype
+        # doa_vec, log_std = self._sanitize(doa_vec, log_std)
+        labels_vec, valid_mask = self._labels_to_vec(labels)
+        best_s, chosen_mask, chosen_tgt = self._best_speaker(doa_vec, labels_vec, valid_mask)
+
+        #flatten
+        pred_flat, tgt_flat, mask_flat, logstd_flat = doa_vec.reshape(B, -1, 2), chosen_tgt.reshape(B, -1, 2), chosen_mask.reshape(B, -1), log_std.reshape(B, -1)
+
+        if mask_flat.any():
+            sel_pred = pred_flat[mask_flat]
+            sel_tgt = tgt_flat[mask_flat]
+            sel_logstd = logstd_flat[mask_flat]
+            a = self._angle_metric(sel_pred, sel_tgt)
+            a2 = a.clip(0, deg2rad(self.cfg.error_bound_on_mse)) * a.clip(0, deg2rad(self.cfg.error_bound_on_mse))
+            alpha = self._alpha()
+            loss_ang = a2.mean()
+            loss_nll = self.negative_log_likelihood_func(a2, sel_logstd, self.cfg.log_var_weight)
+            loss_main = (1 - alpha) * loss_ang + alpha * loss_nll
+            mae = torch.abs(a).mean()
         else:
-            dot = (sel_pred * sel_tgt).sum(-1).clamp(-1 + 1e-7, 1 - 1e-7) 
-            cross = sel_pred[..., 0] * sel_tgt[..., 1] - sel_pred[..., 1] * sel_tgt[..., 0] 
-            ang = torch.atan2(cross.abs(), dot) # (N_sel,) 
-            ang2 = ang * ang 
-            
-            if self.current_epoch < self.cfg.initial_warmup: 
-                alpha = 0.0 
-            else: 
-                denom = max(1, self.cfg.warmup - self.cfg.initial_warmup) 
-                alpha = float(min(1.0, (self.current_epoch - self.cfg.initial_warmup) / denom)) 
-                loss_ang = ang2.mean() 
-                loss_unc = (0.5 * (ang2 * torch.exp(-sel_ls)) + (self.cfg.log_var_weight * sel_ls)).mean() 
-                loss_main = (1 - alpha) * loss_ang + alpha * loss_unc 
-                mae = ang.mean() # encourage higher log-std on noise bins (finite-safe) 
-                
-                noise_mask = ~chosen_mask 
-                noise_logstd = log_std[noise_mask] 
-                noise_logstd = noise_logstd[torch.isfinite(noise_logstd)] 
-                loss_noise = ( F.relu(getattr(self.cfg, "noise_logstd_min", 0.0) - noise_logstd).mean() if noise_logstd.numel() else torch.tensor(0.0, device=device, dtype=dtype) ) 
-                
-                final_loss = loss_main + self.cfg.noise_beta * loss_noise 
-                
-            return final_loss, mae.detach(), best_s.detach()
+            loss_main = doa_vec.sum() * 0.0
+            mae = torch.tensor(0.0, device=device, dtype=dtype)
+        loss_noise = self._noise_regularizer(log_std, chosen_mask, device, dtype)
+        final_loss = loss_main + self.cfg.noise_beta * loss_noise + self.cfg.regularization_constant
+        return final_loss, mae.detach(), best_s.detach()
     
     def training_step(self, batch,  batch_idx):
         spectrum, labels, _ = batch
@@ -271,9 +275,9 @@ class DOAMAMBA(pl.LightningModule):
         doa     = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
 
         if batch_idx == 0 and labels.size(0) > 1:
-            save_sample_as_image(doa[1].cpu(), labels[1, 0].cpu(), std[1].cpu(), "DOA_1_example.png")
+            save_sample_as_image(doa[1].cpu(), labels[1, 0].cpu(), std[1].cpu(), title=f'{labels[1, 0][0]}->{labels[1, 0][-1]}', filename="DOA_1_example.png")
             if ~torch.isnan(labels[1, 1].cpu()).any():
-                save_sample_as_image(doa[1].cpu(), labels[1, 1].cpu(), std[1].cpu(), "DOA_2_example.png")
+                save_sample_as_image(doa[1].cpu(), labels[1, 1].cpu(), std[1].cpu(), title=f'{labels[1, 1][0]}->{labels[1, 1][-1]}', filename="DOA_2_example.png")
 
         val_loss, mae, best_spk = self.loss(doa_unit, log_std, labels, batch_idx)
 
@@ -354,8 +358,8 @@ def main(cfg):
         logger=logger,
         max_epochs=cfg.epochs,
         accelerator="cuda" if torch.cuda.is_available() else "cpu",  
-        devices=[7] if torch.cuda.is_available() else 0,
-        gradient_clip_val=1,
+        devices=[cfg.default_gpu] if torch.cuda.is_available() else 0,
+        gradient_clip_val=0.5,
         gradient_clip_algorithm="norm",
         # strategy='ddp',
         # sync_batchnorm=True,

@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import densenet121
 from einops import rearrange, repeat, einsum
+from scipy.special import i0, i0e
 
 class ChannelCNN(nn.Module):
     def __init__(self, receivers_num=9, out_channels=1):
@@ -351,3 +352,18 @@ class FeatureEncoder(nn.Module):
     def forward(self, x):
         x = self.pre_conv(x)
         return x
+    
+
+## Loss functions ##
+
+def gaussian_loss(mean_err_squared, log_std, log_var_weight=1):
+    return (0.5 * (mean_err_squared * torch.exp(-log_std)) + (log_var_weight * log_std)).mean() 
+
+def von_mises_loss(mean_err_squared, log_std, log_var_weight=1):
+    angle_error = torch.sqrt(mean_err_squared).clamp(0, torch.pi)
+    log_kappa = -2 * log_std
+    kappa = torch.exp(log_kappa).clamp(max=5e2).to(torch.float64) # since the float is numerically limited, using a max kappa of 500 will bring us good enough results 
+
+    log_I0 = torch.log(torch.i0(kappa) + 1e-8)
+    nll = -(kappa * torch.cos(angle_error) - log_I0) + log_var_weight * log_kappa # von Mises NLL: -log(I0(kappa)) - kappa * cos(error)
+    return nll.mean()

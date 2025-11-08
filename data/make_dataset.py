@@ -10,6 +10,8 @@ import os
 import hydra
 import sys
 
+import matplotlib.pyplot as plt
+
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -55,92 +57,138 @@ def convert_wv12wav(args):
         subprocess.run([os.getcwd() + '/data/sph2pipe.exe', '-f', 'wav', old_path, new_path], check=True)
 
 
-def sanity_check_gevd(args):
-    """
-    One clean tone → STFT → estimate_rtf() → DOA
-    Succeeds if |error| ≲ 1° for a well-behaved RTF estimator.
-    """
-    # ------------------------------------------------------------------ #
-    # 0.  Convenience aliases & numeric hygiene
-    # ------------------------------------------------------------------ #
-    fs   = args.fs
-    c    = args.sound_velocity          # m s-1
-    f0   = 1000.0                       # test tone [Hz]
-    T    = 1.0                          # signal duration [s]
+def sanity_check_gevd(args, theta=0):
+    fs   = float(args.fs)
+    c    = float(args.sound_velocity)
+    f0   = 1000.0
+    T    = 1.0
     hop  = int(args.win_len * (1 - args.overlap))
+    lam  = c / f0
 
-    # ------------------------------------------------------------------ #
-    # 1.  Microphone geometry & ground-truth source
-    # ------------------------------------------------------------------ #
-    azim_gt = torch.deg2rad(torch.tensor(124.5))
-    mic_pos = torch.as_tensor(args.receivers_coords)  # (M,3)
-    centre  = mic_pos.mean(0)
-    src_pos = centre + torch.tensor([2.0*torch.cos(azim_gt),
-                                     2.0*torch.sin(azim_gt),
-                                     0.0])
+    # geometry: two mics on x-axis at 0 and 0.5*lambda
+    azim_gt = torch.deg2rad(torch.tensor(float(theta), dtype=torch.float64))
+    mic_pos = lam * torch.tensor([[0.0, 0.0, 0.0],
+                                  [0.5, 0.0, 0.0]], dtype=torch.float64)
+    d = float(torch.abs(mic_pos[1, 0] - mic_pos[0, 0]))  # spacing
 
-    # geometric (far-field) delays, referenced to mic 0
-    dists  = torch.linalg.norm(mic_pos - src_pos, dim=1)          # metres
-    tau    = (dists - dists[0]) / c                               # seconds
+    # synth data
+    tau = (mic_pos[:, 0] * torch.cos(azim_gt)) / c  # per-mic delay
+    t = torch.arange(int(fs*T), dtype=torch.float64) / fs
+    x = torch.sin(2*torch.pi*f0*(t[None, :] - tau[:, None]))  # (M,N)
+    x = x + 1e-6*torch.randn_like(x)
 
-    # ------------------------------------------------------------------ #
-    # 2.  Synthesise the multichannel tone
-    # ------------------------------------------------------------------ #
-    t = torch.arange(int(fs*T)) / fs               # (Nt,)
-    x = torch.sin(2*torch.pi*f0*(t[None, :] - tau[:, None]))      # (M,Nt)
-    x += 1e-6*torch.randn_like(x)                                 # tiny noise
-
-    # ------------------------------------------------------------------ #
-    # 3.  STFT  →  relative transfer function (RTF)
-    # ------------------------------------------------------------------ #
+    # STFT
     spect = torch.stft(x,
                        n_fft=args.win_len,
                        hop_length=hop,
-                       return_complex=True)                       # (M,F,Ts)
-    rtf = estimate_rtf(spect)                                     # (M-1,F,Ts)
+                       center=False,
+                       return_complex=True)  # (M,F,T)
 
-    # ------------------------------------------------------------------ #
-    # 4.  Pick the bin that actually contains the test tone
-    # ------------------------------------------------------------------ #
-    power_f = (spect[0].abs()**2).mean(dim=-1)                    # (F,)
-    tone_bin = torch.argmax(power_f).item()
+    # RTF estimate: disable VAD (all zeros)
+    Fbins, Ts = spect.shape[1], spect.shape[-1]
+    vad = torch.zeros(Fbins, Ts, dtype=torch.bool, device=spect.device)
+    rtf = estimate_rtf(spect, vad_mask=vad)  # expect shape (M-1,F,T) w.r.t. ref mic 0
 
-    rtf_bin  = rtf[:, tone_bin, :]                                # (M-1,Ts)
-    rtf_mean = rtf_bin.mean(dim=-1)                               # (M-1,)
+    # pick tone bin by power in mic 0
+    power_f = (spect[0].abs()**2).mean(dim=-1)         # (F,)
+    tone_bin = int(torch.argmax(power_f).item())
 
-    # ------------------------------------------------------------------ #
-    # 5.  Phase → differential time-of-arrival (TDOA)
-    # ------------------------------------------------------------------ #
-    phi      = torch.angle(rtf_mean)                                # radians
-    tau_hat = phi / (2*torch.pi*f0)                                 # seconds (M-1,)
+    # take the single RTF channel between mic1 and mic0, average over time
+    # If your estimate_rtf returns (M,F,T) instead of (M-1,F,T), change to:
+    # rtf_bin = spect[1, tone_bin, :] / (spect[0, tone_bin, :] + 1e-12)
+    rtf_bin = rtf[0, tone_bin, :]                      # (T,)
+    rtf_mean = torch.mean(rtf_bin)                     # complex scalar
 
-    # prepend zero for the reference mic so vectors align with mic_pos
-    tau_hat = torch.cat([torch.zeros(1),
-                         tau_hat])                                # (M,)
+    # unwrap to principal value [-pi, pi]
+    phi = torch.atan2(rtf_mean.imag, rtf_mean.real).item()
 
-    # ------------------------------------------------------------------ #
-    # 6.  Least-squares DOA for arbitrary 2-D arrays
-    #       (A u = c·tau   with u = [cosθ, sinθ]^⊤,  ||u||=1)
-    # ------------------------------------------------------------------ #
-    A  = mic_pos[:, :2] - mic_pos[0, :2]                          # (M,2)
-    b  = (c * tau_hat).unsqueeze(-1)                              # (M,1)
+    # effective frequency of chosen bin
+    freqs = torch.fft.rfftfreq(args.win_len, d=1.0/fs).numpy()
+    f_eff = float(freqs[tone_bin])
+    k = 2.0 * np.pi * f_eff / c
 
-    # Solve A_rel u = b_rel (ignore the first row which is all zeros)
-    sol = torch.linalg.lstsq(A[1:], b[1:]).solution.squeeze()     # (2,)
-    u   = sol / torch.norm(sol)                                   # unit vector
-    theta_est = torch.atan2(u[1], u[0])                           # rad
+    # model: phi ≈ -k d cos(theta)
+    cos_theta = -phi / (k * d)
 
-    # ------------------------------------------------------------------ #
-    # 7.  Pretty print
-    # ------------------------------------------------------------------ #
-    def deg(x): return float(torch.rad2deg(x))
-    err = deg(abs(theta_est - torch.remainder(azim_gt, 2*torch.pi)) % (2 * np.pi)) 
-    print(f"Ground-truth azimuth                : {deg(torch.remainder(azim_gt, 2*torch.pi)):6.2f}°")
-    print(f"Estimated DOA (phase LS)           : {deg(theta_est):6.2f}°")
-    print(f"Absolute error                     : {err:6.2f}°")
-    print('---finished sanity checks!---')
+    # clamp numerical noise and compute angle
+    cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
+    theta_est = float(np.arccos(cos_theta))            # radians, in [0, pi]
 
+    return np.rad2deg(theta_est)
 
+def sweep_and_plot(cfg, save_path="/workspaces/confidence_localization/samples/"):
+    # sweep GT azimuths in radians
+    thetas = np.linspace(0, 180, 46)   # 1° steps
+    theta_est = []
+
+    for th in tqdm(thetas):
+        # call your sanity check with configurable ground-truth azimuth
+        est = sanity_check_gevd(cfg, theta=th) 
+        theta_est.append(est)
+
+    theta_est_deg = np.array(theta_est)
+
+    plt.figure(figsize=(8,6))
+    plt.plot(thetas, theta_est_deg,
+             linewidth=2.5, color="navy", label="Estimated DOA")
+    plt.plot([0,180], [0,180], "k--", linewidth=1.5, label="Ideal (y=x)")
+
+    plt.xlabel("Ground-truth azimuth [deg]", fontsize=14)
+    plt.ylabel("Estimated DOA [deg]", fontsize=14)
+    plt.title("GEVD Sanity Check Sweep", fontsize=16, fontweight="bold")
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+
+    # save instead of showing
+    plt.savefig(save_path + '/gevd_sanity_sweep.png', dpi=300, bbox_inches="tight")
+    plt.close()
+
+    plt.figure(figsize=(8,6))
+    plt.plot(thetas[:-1], theta_est_deg[:-1]-thetas[:-1],
+             linewidth=2.5, color="navy", label="Estimated DOA error")
+
+    plt.xlabel("Ground-truth azimuth [deg]", fontsize=14)
+    plt.ylabel("Estimated DOA error[deg]", fontsize=14)
+    plt.title("GEVD Sanity Check Sweep Error", fontsize=16, fontweight="bold")
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+
+    # save instead of showing
+    plt.savefig(save_path + '/gevd_sanity_sweep_error.png', dpi=300, bbox_inches="tight")
+    plt.close()
+
+def circ_error_deg(est_deg, gt_deg):
+    """
+    Compute circular error between estimated DOA and ground truth DOA in degrees,
+    handling ambiguity modulo 180°.
+
+    Parameters
+    ----------
+    est_deg : float or array-like
+        Estimated DOA(s) in degrees.
+    gt_deg : float or array-like
+        Ground truth DOA(s) in degrees.
+
+    Returns
+    -------
+    error : float or np.ndarray
+        Circular error(s) in degrees, in the range [-90, 90].
+    """
+    est = np.asarray(est_deg)
+    gt  = np.asarray(gt_deg)
+
+    # Raw difference
+    diff = est - gt
+
+    # Wrap to [-180, 180)
+    diff = (diff + 180) % 360 - 180
+
+    # Because of phase-DOA ambiguity, wrap further to [-90, 90]
+    diff = (diff + 90) % 180 - 90
+
+    return diff
 
 def create_rir_bank(cfg):
     torch.cuda.set_device(7)
@@ -261,21 +309,49 @@ def preprocess(cfg):
     process_path(cfg.val_path)
     print(' --- finished validation ---')
 
+def _count_pt(dir_path):
+    if not os.path.isdir(dir_path):
+        return 0
+    return sum(1 for f in os.listdir(dir_path) if f.endswith(".pt"))
+
+
+
 def create_data(cfg):
-    for _ in tqdm(range(cfg.train_size)):
-        try:
-            mix, mix_id = mix_signal(cfg)
-            torch.save(mix, f"{cfg.train_path}/{mix_id}.pt")
-        except:
-            print("---failed---")
-    print('---finished train!---')
-    for _ in tqdm(range(cfg.val_size)):
-        try:
-            mix, mix_id = mix_signal(cfg)
-            torch.save(mix, f"{cfg.val_path}/{mix_id}.pt")
-        except:
-            print("---failed---")
-    print('---finished validation!---')
+    """
+    Create data up to cfg.train_size / cfg.val_size, counting existing .pt files first.
+    Uses only the os library; minimal logic.
+    """
+    for name, target, out_dir in [
+        ("train", int(cfg.train_size), cfg.train_path),
+        ("val",   int(cfg.val_size),   cfg.val_path),
+    ]:
+        os.makedirs(out_dir, exist_ok=True)
+        existing = _count_pt(out_dir)
+        to_make  = max(0, target - existing)
+        print(f"[{name}] have {existing}/{target}, creating {to_make}...")
+
+        made = 0
+        for _ in tqdm(range(to_make)):
+            try:
+                mix, mix_id = mix_signal(cfg)
+                out = os.path.join(out_dir, f"{mix_id}.pt")
+
+                # avoid accidental overwrite with a tiny suffix loop
+                if os.path.exists(out):
+                    i = 1
+                    while True:
+                        out_try = os.path.join(out_dir, f"{mix_id}_{i}.pt")
+                        if not os.path.exists(out_try):
+                            out = out_try
+                            break
+                        i += 1
+
+                torch.save(mix, out)
+                made += 1
+            except Exception as e:
+                print(f"[{name}] failed: {e}")
+
+        print(f"[{name}] done: {existing + made}/{target}.")
 
 def fix_ptpt_files(directory):
     for filename in tqdm(os.listdir(directory)):
@@ -288,9 +364,19 @@ def fix_ptpt_files(directory):
 
 
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
-def main(cfg, sanity_check_flag=True, convert_wv12wav_flag=False, calculate_rirs=False, create_data_flag=False, preprocess_flag=False):
+def main(cfg, sanity_check_flag=False, convert_wv12wav_flag=False, calculate_rirs=False, create_data_flag=True, preprocess_flag=True):
+
+    import soundfile as sf
+    print('start')
+    for dirpath,_,files in os.walk(cfg.wav_path):
+        for f in files:
+            if f.endswith(".wav"):
+                try: sf.info(os.path.join(dirpath,f))
+                except Exception as e: print("Corrupt WAV:", f, e)
+    print('end')
+
     if sanity_check_flag:
-        sanity_check_gevd(cfg)
+        sweep_and_plot(cfg, save_path="/workspaces/confidence_localization/samples")
     if convert_wv12wav_flag:
         convert_wv12wav(cfg)
     if calculate_rirs:
