@@ -139,15 +139,18 @@ class DOAMAMBA(pl.LightningModule):
 
         self.hidden = nn.Linear(cfg.d_model, 1)
 
-        self.output_head = nn.Sequential(
-            nn.Linear(cfg.input_dim, cfg.input_dim // 2),
-            nn.GELU(),
-            nn.LayerNorm(cfg.input_dim // 2),
-        )
+        # self.output_head = nn.Sequential(
+        #     nn.Linear(cfg.input_dim, cfg.input_dim // 2),
+        #     nn.GELU(),
+        #     nn.LayerNorm(cfg.input_dim // 2),
+        # )
         
-        self.doa = nn.Linear(cfg.input_dim // 2 , 2)
+        self.doa = nn.Sequential(
+            nn.Linear(cfg.input_dim, 2),
+            nn.Tanh()  # output in [-1, 1]
+        )
 
-        self.log_std = nn.Linear(cfg.input_dim // 2, 1)
+        # self.log_std = nn.Linear(cfg.input_dim // 2, 1)
 
         
         self.reset_parameters()
@@ -156,24 +159,24 @@ class DOAMAMBA(pl.LightningModule):
         init.xavier_uniform_(self.hidden.weight)
         init.zeros_(self.hidden.bias)
 
-        init.xavier_uniform_(self.doa.weight)
-        init.zeros_(self.doa.bias)
+        # init.xavier_uniform_(self.doa.weight)
+        # init.zeros_(self.doa.bias)
 
-        init.xavier_uniform_(self.log_std.weight)
-        init.zeros_(self.log_std.bias)
+        # init.xavier_uniform_(self.log_std.weight)
+        # init.zeros_(self.log_std.bias)
 
     def forward(self, x):
         x = x.permute(0, 2, -1, 1)
         
-        for i, block in enumerate(self.mamba_layers):
+        for _, block in enumerate(self.mamba_layers):
             x = block(x.clamp(-10,10))
 
-        x_hat = self.output_head(F.gelu(self.hidden(x).squeeze(-1)).permute(0, 2, 1))  # (B, T, F)
+        x_hat = F.gelu(self.hidden(F.normalize(x,dim=-1)).squeeze(-1)).permute(0, 2, 1)  # (B, T, F)
 
         doa_vec = self.doa(x_hat)                                    
 
-        safe_log_std = torch.clamp(self.log_std(x_hat), min=-2.0, max=1.5)
-        return doa_vec, safe_log_std
+        # safe_log_std = torch.clamp(self.log_std(x_hat), min=-2.0, max=1.5)
+        return F.normalize(doa_vec, dim=-1)
     
     def circ_error(self, angle):
         return ((angle + torch.pi) % (2 * torch.pi) - torch.pi).abs()
@@ -182,7 +185,7 @@ class DOAMAMBA(pl.LightningModule):
         valid = ~torch.isnan(gt)
         if torch.numel(var) > 1:
             var = var[valid]
-        return torch.sum(self.circ_error(est[valid] - gt[valid]) < var) / torch.sum(valid)
+        return torch.sum(self.circ_error(est.unsqueeze(1)[valid] - gt[valid]) < var) / torch.sum(valid)
     
     def _sanitize(self, doa_vec, log_std):
         log_std = log_std.squeeze(-1)
@@ -200,7 +203,7 @@ class DOAMAMBA(pl.LightningModule):
         return 2.0 * torch.asin((d.norm(dim=-1).clamp(0.0, 2.0)) * 0.5)
 
     def _best_speaker(self, pred_unit, labels_vec, valid_mask):
-        B, S, T, _ = labels_vec.shape
+        B, T, _ = labels_vec.shape
         pred_exp = pred_unit.unsqueeze(1).expand(-1, S, -1, -1)
         mean_ang = self._angle_metric(pred_exp, labels_vec).mean(-1)
         mean_ang[torch.isnan(mean_ang)] = float('inf')
@@ -215,6 +218,9 @@ class DOAMAMBA(pl.LightningModule):
             return 0.0
         denom = max(1, self.cfg.warmup - self.cfg.initial_warmup)
         return float(min(1.0, (self.current_epoch - self.cfg.initial_warmup) / denom))
+    
+    def _temporal_regularization(self, doa_vec):
+        return torch.linalg.norm(torch.diff(doa_vec, dim=-1))
 
     def _noise_regularizer(self, log_std, chosen_mask, device, dtype):
         noise_mask = ~chosen_mask
@@ -225,42 +231,42 @@ class DOAMAMBA(pl.LightningModule):
             return F.relu(target_min - noise_logstd).mean()
         return torch.tensor(0.0, device=device, dtype=dtype)
 
-    def loss(self, doa_vec, log_std, labels, batch_idx):
-        B, S, T = labels.shape
+    def loss(self, doa_vec, labels, batch_idx):
+        B, T = labels.shape
         device, dtype = doa_vec.device, doa_vec.dtype
         # doa_vec, log_std = self._sanitize(doa_vec, log_std)
         labels_vec, valid_mask = self._labels_to_vec(labels)
-        best_s, chosen_mask, chosen_tgt = self._best_speaker(doa_vec, labels_vec, valid_mask)
+        # best_s, chosen_mask, chosen_tgt = self._best_speaker(doa_vec, labels_vec, valid_mask)
 
         #flatten
-        pred_flat, tgt_flat, mask_flat, logstd_flat = doa_vec.reshape(B, -1, 2), chosen_tgt.reshape(B, -1, 2), chosen_mask.reshape(B, -1), log_std.reshape(B, -1)
+        pred_flat, tgt_flat = doa_vec.reshape(B, -1, 2), labels_vec.reshape(B, -1, 2)
 
-        if mask_flat.any():
-            sel_pred = pred_flat[mask_flat]
-            sel_tgt = tgt_flat[mask_flat]
-            sel_logstd = logstd_flat[mask_flat]
-            a = self._angle_metric(sel_pred, sel_tgt)
-            a2 = a.clip(0, deg2rad(self.cfg.error_bound_on_mse)) * a.clip(0, deg2rad(self.cfg.error_bound_on_mse))
-            alpha = self._alpha()
-            loss_ang = a2.mean()
-            loss_nll = self.negative_log_likelihood_func(a2, sel_logstd, self.cfg.log_var_weight)
-            loss_main = (1 - alpha) * loss_ang + alpha * loss_nll
-            mae = torch.abs(a).mean()
-        else:
-            loss_main = doa_vec.sum() * 0.0
-            mae = torch.tensor(0.0, device=device, dtype=dtype)
-        loss_noise = self._noise_regularizer(log_std, chosen_mask, device, dtype)
-        final_loss = loss_main + self.cfg.noise_beta * loss_noise + self.cfg.regularization_constant
-        return final_loss, mae.detach(), best_s.detach()
+        # sel_logstd = logstd_flat[mask_flat]
+        a = self._angle_metric(pred_flat, tgt_flat)
+        a2 = a.clip(0, deg2rad(self.cfg.error_bound_on_mse)) * a.clip(0, deg2rad(self.cfg.error_bound_on_mse))
+        # alpha = self._alpha()
+        loss_main = a2.mean()
+        # loss_nll = self.negative_log_likelihood_func(a2, sel_logstd, self.cfg.log_var_weight)
+        # loss_main = (1 - alpha) * loss_ang + alpha * loss_nll
+        mae = torch.abs(a).mean()
+
+        # loss_noise = self._noise_regularizer(log_std, chosen_mask, device, dtype)
+        # final_loss = loss_main + self.cfg.noise_beta * loss_noise + self.cfg.regularization_constant
+        loss_main += self.cfg.temporal_reg_factor * self._temporal_regularization(pred_flat)
+        return loss_main, mae.detach(), None
     
     def training_step(self, batch,  batch_idx):
         spectrum, labels, _ = batch
 
-        doa, std = self(spectrum)
+        doa = self(spectrum)
         
-        train_loss, _, _ = self.loss(doa, std, labels, batch_idx)
+        train_loss, mae, _ = self.loss(doa, labels, batch_idx)
+
+        with torch.autograd.set_detect_anomaly(True):
+            train_loss.backward(retain_graph=True)
 
         self.log("train_loss", train_loss.mean(), on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
+        self.log("train_mae", mae.mean(), on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
 
         return train_loss.to(dtype=torch.float32)
 
@@ -269,26 +275,26 @@ class DOAMAMBA(pl.LightningModule):
         spectrum, labels, title = batch
         B = spectrum.size(0)
 
-        doa_unit, log_std = self(spectrum)
-        log_std = log_std.squeeze(-1)
-        std     = log_std.exp()
+        doa_unit = self(spectrum)
+        # log_std = log_std.squeeze(-1)
+        # std     = log_std.exp()
         doa     = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
 
         if batch_idx == 0 and labels.size(0) > 1:
-            save_sample_as_image(doa[1].cpu(), labels[1, 0].cpu(), std[1].cpu(), title=f'{labels[1, 0][0]}->{labels[1, 0][-1]}', filename="DOA_1_example.png")
-            if ~torch.isnan(labels[1, 1].cpu()).any():
-                save_sample_as_image(doa[1].cpu(), labels[1, 1].cpu(), std[1].cpu(), title=f'{labels[1, 1][0]}->{labels[1, 1][-1]}', filename="DOA_2_example.png")
+            save_sample_as_image(doa[1].cpu(), labels[1].cpu(), 0.01*torch.ones(doa[1].shape).cpu(), title=f'{labels[1][0]}->{labels[1][-1]}', filename="DOA_1_example.png")
+            # if ~torch.isnan(labels[1, 1].cpu()).any():
+            #     save_sample_as_image(doa[1].cpu(), labels[1, 1].cpu(), 0.01*torch.ones(doa[1].shape).cpu(), title=f'{labels[1, 1][0]}->{labels[1, 1][-1]}', filename="DOA_2_example.png")
 
-        val_loss, mae, best_spk = self.loss(doa_unit, log_std, labels, batch_idx)
+        val_loss, mae, best_spk = self.loss(doa_unit, labels, batch_idx)
 
         ref = labels[torch.arange(B, device=labels.device), best_spk]
         ang10  = self.accuracy(doa, ref, torch.tensor(deg2rad(10.0)))
         ang15  = self.accuracy(doa, ref, torch.tensor(deg2rad(15.0)))
-        angStd = self.accuracy(doa, ref, std)
+        angStd = self.accuracy(doa, ref, torch.tensor(deg2rad(5.0)))
 
-        spk_mask  = ~ref.isnan()
-        std_spk   = std[spk_mask].mean()
-        std_noise = std[~spk_mask].mean()
+        # spk_mask  = ~ref.isnan()
+        # std_spk   = std[spk_mask].mean()
+        # std_noise = std[~spk_mask].mean()
 
         self.log_dict(
             {
@@ -297,8 +303,8 @@ class DOAMAMBA(pl.LightningModule):
                 "validation_accuracy_10":  ang10.mean(),
                 "validation_accuracy_15":  ang15.mean(),
                 "validation_accuracy_std": angStd.mean(),
-                "mean_std_over_speakers":  std_spk,
-                "mean_std_over_noise":     std_noise,
+                # "mean_std_over_speakers":  std_spk,
+                # "mean_std_over_noise":     std_noise,
                 "mean_MAE_over_speakers":  mae.mean(),
             },
             on_epoch=True,
@@ -321,6 +327,7 @@ class DOAMAMBA(pl.LightningModule):
 
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
 def main(cfg):
+
     # our_transform = transforms.Normalize(mean=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2], std=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2])
     train_loader = cld.get_dataloader(cfg, cfg.train_path)
     val_loader = cld.get_dataloader(cfg, cfg.val_path)

@@ -1,6 +1,7 @@
 # Data
 /data/processed/
 /data/raw/
+/data/signal_generator/
 
 
 # logs

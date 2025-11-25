@@ -21,7 +21,8 @@ preprocessed_data_flag : True
 
 num_noise_sources : 6
 
-max_num_of_speakers : 2
+pre_speech_noise_time : 1
+max_num_of_speakers : 1
 delete_all_samples_flag: False
 sample_length_secs: 5
 min_sep : 25
@@ -42,9 +43,12 @@ src_height : 1.75
 
 sound_velocity: 340
 T60: 0.36
+hop : 32
+order : 2
+beta : 0.2 
 nsample: 4096
 p_silence: 0.0
-p_one: 0.6
+p_one: 1
 p_movement : 0.5
 dominance_threshold : 0.6
 min_overlap : 0.3
@@ -68,10 +72,11 @@ layers : [2, 2, 4, 4]
 res_alpha : 0.1
 log_var_weight : 1
 
-lr : 1e-3
+lr : 1e-4
 weight_decay: 1e-5
 epochs: 1000
 regularization_constant : 1e-6
+temporal_reg_factor : 1e-4
 
 classification : False
 logvar_confidence_on_noise: False

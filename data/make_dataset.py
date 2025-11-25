@@ -5,6 +5,11 @@ import soundfile as sf
 from tqdm import tqdm
 import subprocess
 import torch
+import random
+import time
+
+import traceback
+from multiprocessing import Pool, cpu_count
 
 import os
 import hydra
@@ -16,8 +21,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import gpuRIR as rir
-
 from confidence_localization.util import compute_multichannel_stft, estimate_rtf
 from data_helpers import compute_nb_img, mix_signal
 
@@ -26,7 +29,10 @@ MAX_CORES_FOR_PREPROCESS = 8
 def convert_wv12wav(args):
     # input - original path of csr-1, sampling rate
     # output - void
-    # function converts between WV1 file to in our original path to a WAV file in our intended path, file SR is fs 
+    # function converts between WV1 file to in our original path to a WAV file in our intended path, file SR is fs
+    #
+    # Basically this function is just a WV1->WAV converter
+    
 
     if args.delete_all_samples_flag:
         if os.path.exists(args.wav_path):
@@ -315,12 +321,54 @@ def _count_pt(dir_path):
     return sum(1 for f in os.listdir(dir_path) if f.endswith(".pt"))
 
 
+def _worker_make_one(args):
+    """
+    Worker function:
+        args = (cfg, out_dir)
+    """
+    cfg, out_dir = args
+
+    # ---- FIX: UNIQUE SEED PER WORKER ----
+    seed = int(time.time() * 1e6) % (2**32 - 1) ^ os.getpid()
+    random.seed(seed)
+    np.random.seed(seed & 0xffffffff)
+    torch.manual_seed(seed & 0xffffffff)
+    # --------------------------------------
+
+    try:
+        mix, mix_id = mix_signal(cfg)
+        out = os.path.join(out_dir, f"{mix_id}.pt")
+
+        # avoid overwrite
+        if os.path.exists(out):
+            i = 1
+            while True:
+                alt = os.path.join(out_dir, f"{mix_id}_{i}.pt")
+                if not os.path.exists(alt):
+                    out = alt
+                    break
+                i += 1
+
+        torch.save(mix, out)
+        return True
+
+    except Exception as e:
+        print(f"[worker] failed with: {e}")
+        traceback.print_exc()
+        return False
+
+
+def _count_pt(path):
+    return sum(f.endswith(".pt") for f in os.listdir(path))
+
 
 def create_data(cfg):
     """
-    Create data up to cfg.train_size / cfg.val_size, counting existing .pt files first.
-    Uses only the os library; minimal logic.
+    Parallel version of dataset generation.
+    Uses multiprocessing.Pool for speed.
     """
+    n_workers = getattr(cfg, "num_workers", cpu_count())
+
     for name, target, out_dir in [
         ("train", int(cfg.train_size), cfg.train_path),
         ("val",   int(cfg.val_size),   cfg.val_path),
@@ -328,30 +376,24 @@ def create_data(cfg):
         os.makedirs(out_dir, exist_ok=True)
         existing = _count_pt(out_dir)
         to_make  = max(0, target - existing)
-        print(f"[{name}] have {existing}/{target}, creating {to_make}...")
+
+        print(f"[{name}] have {existing}/{target}, creating {to_make} using {n_workers} workers...")
+
+        if to_make == 0:
+            print(f"[{name}] nothing to do.")
+            continue
+
+        # pack arguments for pool
+        jobs = [(cfg, out_dir)] * to_make
 
         made = 0
-        for _ in tqdm(range(to_make)):
-            try:
-                mix, mix_id = mix_signal(cfg)
-                out = os.path.join(out_dir, f"{mix_id}.pt")
+        with Pool(processes=n_workers) as pool:
+            for ok in tqdm(pool.imap_unordered(_worker_make_one, jobs), total=to_make):
+                if ok:
+                    made += 1
 
-                # avoid accidental overwrite with a tiny suffix loop
-                if os.path.exists(out):
-                    i = 1
-                    while True:
-                        out_try = os.path.join(out_dir, f"{mix_id}_{i}.pt")
-                        if not os.path.exists(out_try):
-                            out = out_try
-                            break
-                        i += 1
+        print(f"[{name}] done: {existing + made}/{target}")
 
-                torch.save(mix, out)
-                made += 1
-            except Exception as e:
-                print(f"[{name}] failed: {e}")
-
-        print(f"[{name}] done: {existing + made}/{target}.")
 
 def fix_ptpt_files(directory):
     for filename in tqdm(os.listdir(directory)):
@@ -364,23 +406,21 @@ def fix_ptpt_files(directory):
 
 
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
-def main(cfg, sanity_check_flag=False, convert_wv12wav_flag=False, calculate_rirs=False, create_data_flag=True, preprocess_flag=True):
+def main(cfg, sanity_check_flag=False, convert_wv12wav_flag=False, create_data_flag=True, preprocess_flag=False):
 
-    import soundfile as sf
-    print('start')
-    for dirpath,_,files in os.walk(cfg.wav_path):
-        for f in files:
-            if f.endswith(".wav"):
-                try: sf.info(os.path.join(dirpath,f))
-                except Exception as e: print("Corrupt WAV:", f, e)
-    print('end')
+    # import soundfile as sf
+    # print('start')
+    # for dirpath,_,files in os.walk(cfg.wav_path):
+    #     for f in files:
+    #         if f.endswith(".wav"):
+    #             try: sf.info(os.path.join(dirpath,f))
+    #             except Exception as e: print("Corrupt WAV:", f, e)
+    # print('end')
 
     if sanity_check_flag:
         sweep_and_plot(cfg, save_path="/workspaces/confidence_localization/samples")
     if convert_wv12wav_flag:
         convert_wv12wav(cfg)
-    if calculate_rirs:
-        create_rir_bank(cfg)
     if create_data_flag:
         create_data(cfg)
     if preprocess_flag:

@@ -56,33 +56,29 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch
     plt.savefig(path + 'bound_plot_of_'+ filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
     plt.close()
 
-# def save_doas(tensor: torch.Tensor, title: torch.Tensor, filename: str, path='/workspaces/confidence_localization/samples/'):
-#     # Ensure tensor is on CPU and detach if it's a computation graph tensor
-#     if tensor.is_cuda:
-#         tensor = tensor.cpu()
-#     tensor = tensor.detach()
-
-#     plt.figure()
-#     plt.hist(tensor.numpy(), bins=20)
-
-#     plt.xlabel('DOA result [radians]')
-#     plt.ylabel('Count #')
-
-#     plt.title(f'distribiution for case where GT is at : {title} [radians]', fontsize=14, fontweight="bold")
-
-#     # Save the image
-#     plt.savefig(path + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
-#     plt.close()
-
 @script
 def gevd(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Tensor:
-    Rv += eps * torch.eye(Rs.shape[0], dtype=Rs.dtype, device=Rs.device)
     Rv_inv = torch.linalg.inv(Rv)
     L, U = torch.linalg.eig(Rv_inv @ Rs)
-    _, idx = torch.max(L.real, dim=0)
+    idx = torch.argmax(L.real, dim=0)
     principal_vec = U[:, idx]
-    temp = Rv @ principal_vec
-    return temp[1:] / (temp[0] + eps)
+    return principal_vec[1:] / (principal_vec[0] + eps)
+
+@script
+def cholesky(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Tensor:
+    L = torch.linalg.cholesky(Rv)
+    L_inv = torch.inverse(L)
+
+    Rs_white = L_inv @ Rs @ L_inv.conj().T
+
+    vals, vecs = torch.linalg.eig(Rs_white)
+
+    idx = torch.argmax(vals.real)
+    principal_vec = vecs[:, idx]
+
+    white_vec = L.conj().T @ principal_vec
+
+    return white_vec[1:] / (white_vec[0] + eps)
 
 def energy_vad(x, fs, frame_ms=20, hop_ms=10, alpha=4, win_sec=1):
     frame = int(frame_ms*fs/1000)
@@ -100,62 +96,30 @@ def energy_vad(x, fs, frame_ms=20, hop_ms=10, alpha=4, win_sec=1):
     for i in range(1, hang): vad[:-i] |= vad[i:]
     return vad
 
-def vad_frames(signal_ref, energy_threshold, frame_length=4, hop_length=1):
-    vad_mask = torch.zeros_like(signal_ref, dtype=torch.bool)
-
-    if len(signal_ref.shape) > 1:
-        num_bins = signal_ref.shape[0]
-        num_frames = signal_ref.shape[1] // hop_length
-
-        for k in range(num_bins):
-            for i in range(num_frames):
-                start = max(0, (i-1) * hop_length)
-                end = min(num_frames, start + 2*frame_length)
-                frame = signal_ref[k,start:end]
-                frame_energy = (frame.abs() ** 2).mean().item()
-                vad_mask[k,i] = (frame_energy > energy_threshold)
-    else:
-        num_frames = signal_ref.shape[0] // hop_length
-        num_bins = 1
-
-        for i in range(num_frames):
-                start = max(0, (i-1) * hop_length)
-                end = min(num_frames, start + 2*frame_length)
-                frame = signal_ref[start:end]
-                frame_energy = (frame.abs() ** 2).mean().item()
-                vad_mask[i] = (frame_energy > energy_threshold)
-
-    return vad_mask
-
 def estimate_cov_batched(X):
     return (X @ X.conj().transpose(-2, -1)) / X.shape[-1]
 
-def estimate_rtf(spectrums, vad_mask=None, win_len=4):
+def estimate_rtf(cfg, spectrums, win_len=4):
     M, F_bins, T = spectrums.shape
+    T_noise = int((cfg.pre_speech_noise_time * cfg.fs) / (cfg.win_len * (1 - cfg.overlap)))
     win_size = 2 * win_len + 1
 
-    if vad_mask is None:
-        energy = spectrums.abs().pow(2).sum(dim=0)  # (F, T)
-        thresholds = torch.quantile(energy, 0.1, dim=-1, keepdim=True)
-        vad_mask = energy < thresholds  # (F, T)
+    noise_slice = spectrums[..., :T_noise]
+    spectrums = spectrums[..., T_noise:]
+    # the first second of each sample is strictly noise so we have good bases for our decomposition
 
-    rtf = torch.empty(M - 1, F_bins, T, dtype=torch.complex64, device=spectrums.device)
+    rtf = torch.empty(M - 1, F_bins, spectrums.shape[-1], dtype=torch.complex64, device=spectrums.device)
 
-    for f in range(F_bins):
-        vad_f = vad_mask[f]  # (T,)
-        if vad_f.sum() >= 4:
-            noise_frames = spectrums[:, f, vad_f]           # (M, T_vad)
-            Rv = estimate_cov_batched(noise_frames)         # (M, M)
-        else:
-            Rv = 1e-6 * torch.eye(M, dtype=spectrums.dtype, device=spectrums.device)
+    for f in range(F_bins):        # (M, T_vad)
+        Rv = estimate_cov_batched(noise_slice[:, f])
 
-        padded = F.pad(spectrums[:, f, :], pad=(win_len, win_len), mode='constant', value=0)  # (M, T + 2w)
+        padded = F.pad(spectrums[:, f], pad=(win_len, win_len), mode='constant', value=0)  # (M, T + 2w)
         Xf = padded.unfold(-1, size=win_size, step=1)  # (M, T, win_size)
         Xf = Xf.permute(1, 0, 2)  # (T, M, win_size)
 
         Rs = estimate_cov_batched(Xf)  # (T, M, M)
 
-        for t in range(T):
+        for t in range(T-T_noise):
             rtf[:, f, t] = gevd(Rs[t], Rv)
     return rtf  # (M-1, F, T)
 
@@ -168,6 +132,24 @@ def compute_multichannel_stft(signal: np.ndarray, cfg):
     stft_list = []
     for mic_idx in range(M):
         stft_mic = torch.stft(
+            signal_tensor[mic_idx],
+            n_fft=cfg.win_len,
+            hop_length=int(cfg.win_len * (1 - cfg.overlap)),
+            return_complex=True
+        )
+        stft_list.append(stft_mic)
+
+    stft_tensor = torch.stack(stft_list, dim=0)
+    return stft_tensor
+
+def compute_multichannel_istft(signal: np.ndarray, cfg):
+    T, _, M = signal.shape
+    signal_tensor = torch.from_numpy(signal).float()
+    signal_tensor = signal_tensor.permute(2, 0, 1).squeeze(-1)
+
+    stft_list = []
+    for mic_idx in range(M):
+        stft_mic = torch.istft(
             signal_tensor[mic_idx],
             n_fft=cfg.win_len,
             hop_length=int(cfg.win_len * (1 - cfg.overlap)),

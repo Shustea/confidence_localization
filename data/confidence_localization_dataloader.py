@@ -1,7 +1,7 @@
 import os
 import torch
 import math
-from numpy import isnan, zeros, concatenate
+from numpy import isnan, zeros, concatenate, array, argmax
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.functional import one_hot
 import soundfile as sf
@@ -36,7 +36,7 @@ class CLDataset(Dataset):
         
         labels = assign_gt_to_tf_bin(self.cfg, rtf[0].shape, sample_name, self.classification)
         
-        rtf = (rtf - rtf.mean(1).unsqueeze(1)) / (rtf.std(1).unsqueeze(1) + 1e-6) # Normalize over F
+        rtf = (rtf - rtf.mean(-1).unsqueeze(-1)) / (rtf.std(-1).unsqueeze(-1) + 1e-6) # Normalize over F
 
         if self.transform:
             rtf = self.transform(rtf)
@@ -103,7 +103,7 @@ def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
             signal = float(g[speaker_idx]) * signal
 
         signal_power = torch.tensor(signal**2)
-        all_spectra.append(signal_power)
+        all_spectra.append(signal_power.median())
 
     for speaker_idx in range(len(speakers)):
         doa_start, doa_end = doas[speaker_idx]
@@ -112,7 +112,7 @@ def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
 
         labels[speaker_idx] = doa_map
 
-    return torch.remainder(labels + pi, 2 * pi) - pi
+    return torch.remainder(labels[argmax(array(all_spectra))] + pi, 2 * pi) - pi
 
 def get_speaker_positions_from_path(path):
     # Split on hyphens that come after a non-digit/letter (i.e., real separator)
