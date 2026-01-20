@@ -25,6 +25,9 @@ RUN pip install --upgrade pip setuptools wheel && \
     pip install --no-build-isolation --no-cache-dir pybind11>=2.11.0 mamba-ssm==2.2.2 && \
     pip install --no-cache-dir -r requirements.txt
 
+# ---- ensure C++ sources exist ----
+COPY --chown=shustea:shustea data/signal_generator /workspace/data/signal_generator
+
 # ---- C++ build ----
 WORKDIR /workspace/data/signal_generator
 RUN rm -rf build CMakeCache.txt CMakeFiles && \

@@ -32,7 +32,7 @@ def main(cfg):
 
     device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
 
-    checkpoint_path = '/workspaces/confidence_localization/outputs/2025-07-07/21-26-20/models/best-loss-checkpoint-epoch=73-validation_loss_epoch=0.00.ckpt'
+    checkpoint_path = '/workspaces/confidence_localization/outputs/2026-01-18/21-35-46/models/best-acc10-epoch=116-validation_accuracy_10=0.91.ckpt'
     cl_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(cl_dict['state_dict'], strict=False)
     model.to(device).eval()

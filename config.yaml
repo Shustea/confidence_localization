@@ -9,72 +9,73 @@ save_dir: "/workspaces/confidence_localization/models/"
 
 default_gpu : 7
 
-# resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2025-07-07/21-26-20/models/best-loss-checkpoint-epoch=73-validation_loss_epoch=0.00.ckpt"
+resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2026-01-18/21-35-46/models/best-acc10-epoch=116-validation_accuracy_10=0.91.ckpt"
 
 train_size : 5400
 val_size : 600
 
 batch_size: 8
-num_workers: 4
+num_workers: 8
 
 preprocessed_data_flag : True
 
 num_noise_sources : 6
 
-pre_speech_noise_time : 1
+pre_speech_noise_time : 2
 max_num_of_speakers : 1
 delete_all_samples_flag: False
-sample_length_secs: 5
+sample_length_secs: 8
 min_sep : 25
 # possible_heights: [1.65, 1.675, 1.7, 1.725, 1.75, 1.775, 1.8, 1.825, 1.85]
 # possible_heights: [1.75]
-room_dim: [5, 5, 2.5]
+room_dim: [5, 5, 2.6]
 receivers_coords:
-  - [1.500, 1.500, 0.750]
-  - [1.525, 1.500, 0.750]
-  - [1.518, 1.518, 0.750]
-  - [1.500, 1.525, 0.750] 
-  - [1.482, 1.518, 0.750]   
-  - [1.475, 1.500, 0.750]   
-  - [1.482, 1.482, 0.750]   
-  - [1.500, 1.475, 0.750]   
-  - [1.518, 1.482, 0.750]
+  - [2.500, 2.500, 0.750]
+  - [2.550, 2.500, 0.750]
+  - [2.500, 2.550, 0.750]
+  - [2.450, 2.500, 0.750] 
+  - [2.500, 2.450, 0.750]   
+
+J : 1 #amount of pink noise sources
+
 src_height : 1.75
 
 sound_velocity: 340
-T60: 0.36
 hop : 32
-order : 2
-beta : 0.2 
-nsample: 4096
+order : -1
+beta : 0.34
+nsample: 2048
 p_silence: 0.0
 p_one: 1
 p_movement : 0.5
 dominance_threshold : 0.6
 min_overlap : 0.3
 max_overlap : 0.9
+snr_db : 20
 
-recivers_num : 9
+recivers_num : 5
 
 fs: 16000
-win_len : 512
+nfft : 1024
+win_len : 8
 overlap : 0.75
+exp_window_smoothing : 0.9
 
 eps: 1e-6
 
-input_dim : 257
-d_model : 16
-freq_dim : 257
-time_dim : 626
+input_dim : 1024
+d_model : 4
+freq_dim : 1024
+time_dim : 376
 hidden_dim : 64
 conv_dim : 4
-layers : [2, 2, 4, 4]
+layers : [2, 4, 4, 4]
 res_alpha : 0.1
 log_var_weight : 1
 
-lr : 1e-4
+lr : 5e-4
 weight_decay: 1e-5
-epochs: 1000
+epochs: 300
 regularization_constant : 1e-6
 temporal_reg_factor : 1e-4
 

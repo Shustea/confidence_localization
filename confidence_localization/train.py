@@ -29,81 +29,54 @@ import confidence_localization_dataloader as cld
 from util import save_sample_as_image
 
 
+class MambaResFreq(nn.Module):
+    def __init__(self, cfg, expand=2):
+        super().__init__()
+        self.mamba = Mamba(d_model=cfg.d_model, d_state=cfg.hidden_dim, d_conv=cfg.conv_dim, expand=expand)
+
+    def forward(self, x):
+        B, Freq, T, d = x.shape
+        y = x.contiguous().view(B * Freq, T, d)
+        y = self.mamba(y).view(B, Freq, T, d)
+        return x + y
+
+
+class MambaResTime(nn.Module):
+    def __init__(self, cfg, expand=2):
+        super().__init__()
+        self.mamba = Mamba(d_model=cfg.d_model, d_state=cfg.hidden_dim, d_conv=cfg.conv_dim, expand=expand)
+
+    def forward(self, x):
+        B, Freq, T, d = x.shape
+        y = x.transpose(1, 2).contiguous().view(B * T, Freq, d)
+        y = self.mamba(y).view(B, T, Freq, d).transpose(1, 2)
+        return x + y
+
+
 class MambaResChannel(nn.Module):
     def __init__(self, cfg, expand: int = 2):
         super().__init__()
-        channels = (
-            getattr(cfg, "receivers_num", None)
-            or getattr(cfg, "recivers_num", None)
-            or getattr(cfg, "channels", None)
-            )
-        channels = 2 * (channels - 1)
-
-        d_model = getattr(cfg, "d_model", None)
-        if channels is None and d_model is None:
-            raise AttributeError("Provide cfg.receivers_num (or channels) and/or cfg.d_model.")
-        if channels is None:
-            channels = d_model
-        if d_model is None:
-            d_model = channels
-        self.channels = channels
-        self.d_model = d_model
+        channels = (getattr(cfg, "receivers_num", None) or getattr(cfg, "recivers_num", None)) - 1
+        d_model = getattr(cfg, "d_model", channels)
+        self.channels, self.d_model = channels, d_model
         self.use_proj = (channels != d_model)
         if self.use_proj:
             self.in_proj  = nn.Linear(channels, d_model)
             self.out_proj = nn.Linear(d_model, channels)
         self.norm = nn.LayerNorm(d_model)
-        self.mamba = Mamba(
-            d_model=d_model,
-            d_state=getattr(cfg, "hidden_dim", 64),
-            d_conv=getattr(cfg, "conv_dim", 4),
-            expand=expand
-        )
+        self.mamba = Mamba(d_model=d_model, d_state=getattr(cfg, "hidden_dim", 64), d_conv=getattr(cfg, "conv_dim", 4), expand=expand)
         self.dropout = nn.Dropout(getattr(cfg, "dropout", 0.0))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, F, T, C = x.shape
-        if C != self.channels:
-            raise ValueError(f"Expected C={self.channels}, got {C}")
-        L = F * T
-        y = x.reshape(B, L, C)
+        y = x.contiguous().view(B, F * T, C)
         if self.use_proj:
             y = self.in_proj(y)
-        y = self.norm(y)
-        y = self.mamba(y)
+        y = self.mamba(self.norm(y))
         if self.use_proj:
             y = self.out_proj(y)
-        y = self.dropout(y)
-        y = y.reshape(B, F, T, C)
+        y = self.dropout(y).view(B, F, T, C)
         return x + y
-
-class MambaResFreq(nn.Module):
-    def __init__(self, cfg, expand=2):
-        super().__init__()
-        self.mamba = Mamba(
-            d_model=cfg.d_model,  # model dimension
-            d_state=cfg.hidden_dim,  # state dim
-            d_conv=cfg.conv_dim,  # conv dim
-            expand=expand  # FFN expansion ratio
-        )
-
-    def forward(self, x):
-        B, Freq, T, d = x.shape
-        return (x + self.mamba(x.reshape(B * Freq, T, d)).reshape(B ,Freq, T, d))
-    
-class MambaResTime(nn.Module):
-    def __init__(self, cfg, expand=2):
-        super().__init__()
-        self.mamba = Mamba(
-            d_model=cfg.d_model,  # model dimension
-            d_state=cfg.hidden_dim,  # state dim
-            d_conv=cfg.conv_dim,  # conv dim
-            expand=expand  # FFN expansion ratio
-        )
-
-    def forward(self, x):
-        B, Freq, T, d = x.shape
-        return (x + self.mamba(x.permute(0, 2, 1, -1).reshape(B * T, Freq, d)).reshape(B ,Freq, T, d))
     
 class MambaResTF(nn.Module):
     def __init__(self, cfg, expand=2):
@@ -122,13 +95,14 @@ class MambaResCTF(nn.Module):
         self.mambaC = MambaResChannel(cfg, expand)
 
     def forward(self, x):
-        return self.mambaTF(self.mambaC(x))
+        return self.mambaC(self.mambaTF(x))
 
 class DOAMAMBA(pl.LightningModule):
     def __init__(self, cfg):
         super(DOAMAMBA, self).__init__()
 
         self.cfg = cfg
+        self.strict_loading = False
 
         self.negative_log_likelihood_func = [gaussian_loss if cfg.nnl_func == 'gaussian' else von_mises_loss if cfg.nnl_func == 'von_mises' else None][0]
         
@@ -138,19 +112,16 @@ class DOAMAMBA(pl.LightningModule):
         ])
 
         self.hidden = nn.Linear(cfg.d_model, 1)
-
-        # self.output_head = nn.Sequential(
-        #     nn.Linear(cfg.input_dim, cfg.input_dim // 2),
-        #     nn.GELU(),
-        #     nn.LayerNorm(cfg.input_dim // 2),
-        # )
         
         self.doa = nn.Sequential(
             nn.Linear(cfg.input_dim, 2),
             nn.Tanh()  # output in [-1, 1]
         )
 
-        # self.log_std = nn.Linear(cfg.input_dim // 2, 1)
+        self.log_std = nn.Sequential(
+            nn.Linear(cfg.input_dim, 1),
+            nn.Tanh()  # output in [-1, 1]
+        )
 
         
         self.reset_parameters()
@@ -166,17 +137,14 @@ class DOAMAMBA(pl.LightningModule):
         # init.zeros_(self.log_std.bias)
 
     def forward(self, x):
-        x = x.permute(0, 2, -1, 1)
-        
-        for _, block in enumerate(self.mamba_layers):
-            x = block(x.clamp(-10,10))
+        x = x.permute(0, -1, 2, 1).contiguous()
 
-        x_hat = F.gelu(self.hidden(F.normalize(x,dim=-1)).squeeze(-1)).permute(0, 2, 1)  # (B, T, F)
+        for block in self.mamba_layers:
+            x = block(F.normalize(x, dim=-1))
 
-        doa_vec = self.doa(x_hat)                                    
-
-        # safe_log_std = torch.clamp(self.log_std(x_hat), min=-2.0, max=1.5)
-        return F.normalize(doa_vec, dim=-1)
+        x_hat = F.gelu(self.hidden(F.normalize(x, dim=-1)).squeeze(-1)).permute(0, 2, 1)
+        doa_vec = self.doa(x_hat)
+        return F.normalize(doa_vec, dim=-1), self.log_std(x_hat)
     
     def circ_error(self, angle):
         return ((angle + torch.pi) % (2 * torch.pi) - torch.pi).abs()
@@ -231,39 +199,39 @@ class DOAMAMBA(pl.LightningModule):
             return F.relu(target_min - noise_logstd).mean()
         return torch.tensor(0.0, device=device, dtype=dtype)
 
-    def loss(self, doa_vec, labels, batch_idx):
-        B, T = labels.shape
-        device, dtype = doa_vec.device, doa_vec.dtype
-        # doa_vec, log_std = self._sanitize(doa_vec, log_std)
-        labels_vec, valid_mask = self._labels_to_vec(labels)
-        # best_s, chosen_mask, chosen_tgt = self._best_speaker(doa_vec, labels_vec, valid_mask)
+    def loss(self, doa_vec, log_std, labels, batch_idx, vad=None):
+        pred = F.normalize(doa_vec, dim=-1)
+        tgt = torch.stack((labels.cos(), labels.sin()), dim=-1)
 
-        #flatten
-        pred_flat, tgt_flat = doa_vec.reshape(B, -1, 2), labels_vec.reshape(B, -1, 2)
+        if vad is None:
+            w = torch.isfinite(labels).float()
+        else:
+            w = vad.float() * torch.isfinite(labels).float()
 
-        # sel_logstd = logstd_flat[mask_flat]
-        a = self._angle_metric(pred_flat, tgt_flat)
-        a2 = a.clip(0, deg2rad(self.cfg.error_bound_on_mse)) * a.clip(0, deg2rad(self.cfg.error_bound_on_mse))
-        # alpha = self._alpha()
-        loss_main = a2.mean()
-        # loss_nll = self.negative_log_likelihood_func(a2, sel_logstd, self.cfg.log_var_weight)
-        # loss_main = (1 - alpha) * loss_ang + alpha * loss_nll
-        mae = torch.abs(a).mean()
+        cos = (pred * tgt).sum(dim=-1).clamp(-1.0, 1.0)
+        per = 1.0 - cos
 
-        # loss_noise = self._noise_regularizer(log_std, chosen_mask, device, dtype)
-        # final_loss = loss_main + self.cfg.noise_beta * loss_noise + self.cfg.regularization_constant
-        loss_main += self.cfg.temporal_reg_factor * self._temporal_regularization(pred_flat)
-        return loss_main, mae.detach(), None
+        denom = w.sum().clamp_min(1.0)
+        loss_main = (per * w).sum() / denom
+
+        mae = torch.acos(cos.clamp(-0.999999, 0.999999))
+        mae = (mae * w).sum().detach() / denom
+
+        lam = float(getattr(self.cfg, "temporal_reg_factor", 0.0))
+        if lam > 0 and pred.shape[1] > 1:
+            w2 = (w[:, 1:] * w[:, :-1])
+            denom2 = w2.sum().clamp_min(1.0)
+            tv = (pred[:, 1:] - pred[:, :-1]).norm(dim=-1)
+            loss_main = loss_main + lam * (tv * w2).sum() / denom2
+
+        return loss_main, mae, None
     
     def training_step(self, batch,  batch_idx):
         spectrum, labels, _ = batch
 
-        doa = self(spectrum)
+        doa, log_std = self(spectrum)
         
-        train_loss, mae, _ = self.loss(doa, labels, batch_idx)
-
-        with torch.autograd.set_detect_anomaly(True):
-            train_loss.backward(retain_graph=True)
+        train_loss, mae, _ = self.loss(doa, log_std, labels, batch_idx)
 
         self.log("train_loss", train_loss.mean(), on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
         self.log("train_mae", mae.mean(), on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
@@ -275,9 +243,8 @@ class DOAMAMBA(pl.LightningModule):
         spectrum, labels, title = batch
         B = spectrum.size(0)
 
-        doa_unit = self(spectrum)
-        # log_std = log_std.squeeze(-1)
-        # std     = log_std.exp()
+        doa_unit, log_std = self(spectrum)
+
         doa     = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
 
         if batch_idx == 0 and labels.size(0) > 1:
@@ -285,7 +252,7 @@ class DOAMAMBA(pl.LightningModule):
             # if ~torch.isnan(labels[1, 1].cpu()).any():
             #     save_sample_as_image(doa[1].cpu(), labels[1, 1].cpu(), 0.01*torch.ones(doa[1].shape).cpu(), title=f'{labels[1, 1][0]}->{labels[1, 1][-1]}', filename="DOA_2_example.png")
 
-        val_loss, mae, best_spk = self.loss(doa_unit, labels, batch_idx)
+        val_loss, mae, best_spk = self.loss(doa_unit, log_std, labels, batch_idx)
 
         ref = labels[torch.arange(B, device=labels.device), best_spk]
         ang10  = self.accuracy(doa, ref, torch.tensor(deg2rad(10.0)))
@@ -323,6 +290,10 @@ class DOAMAMBA(pl.LightningModule):
         'monitor': 'train_loss'
         }
         return {'optimizer': optimizer, 'scheduler': scheduler}
+    
+    def on_load_checkpoint(self, ckpt):
+        ckpt.pop("optimizer_states", None)
+        ckpt.pop("lr_schedulers", None)
         
 
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
@@ -335,6 +306,10 @@ def main(cfg):
     logger = TensorBoardLogger("/workspaces/confidence_localization/logs", name="DOAMAMBA")
 
     model = DOAMAMBA(cfg)
+
+    ckpt = cfg.resume_from_checkpoint if ("resume_from_checkpoint" in cfg.keys()) else None
+    if ckpt:
+        model = DOAMAMBA.load_from_checkpoint(ckpt, cfg=cfg, strict=False)
 
     checkpoint_loss_callback = ModelCheckpoint(
     monitor="validation_loss",  # Monitor validation loss
@@ -364,16 +339,15 @@ def main(cfg):
     trainer = pl.Trainer(
         logger=logger,
         max_epochs=cfg.epochs,
-        accelerator="cuda" if torch.cuda.is_available() else "cpu",  
+        accelerator="cuda" if torch.cuda.is_available() else "cpu",
         devices=[cfg.default_gpu] if torch.cuda.is_available() else 0,
+        precision="16-mixed" if torch.cuda.is_available() else 32,
         gradient_clip_val=0.5,
         gradient_clip_algorithm="norm",
-        # strategy='ddp',
-        # sync_batchnorm=True,
-        callbacks=[checkpoint_loss_callback, checkpoint_acc_callback_10, checkpoint_acc_callback_std]
+        callbacks=[checkpoint_loss_callback, checkpoint_acc_callback_10, checkpoint_acc_callback_std],
     )
-    ckpt_path = cfg.resume_from_checkpoint if ('resume_from_checkpoint' in cfg.keys()) else None
-    trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
+    
+    trainer.fit(model, train_loader, val_loader)
 
 if __name__ == "__main__":
     torch.cuda.empty_cache()

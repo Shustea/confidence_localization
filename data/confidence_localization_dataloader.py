@@ -21,7 +21,7 @@ class CLDataset(Dataset):
         self.sample_rate = cfg.fs
         self.cfg = cfg
         self.transform = transform
-        self.T60 = cfg.T60
+        self.beta = cfg.beta
         self.classification = cfg.classification
         self.sample_files = [os.path.join(root_dir, f) for f in os.listdir(root_dir) if f.endswith('.pt')]
 
@@ -42,27 +42,7 @@ class CLDataset(Dataset):
             rtf = self.transform(rtf)
 
         return rtf, labels, str(title)[8:-2]
-
-# def normalize_data(rtf, cfg):
-#     if cfg.data_standardization == "minmax":
-#         return rtf / (rtf.max() - rtf.min())
- 
-def estimate_prtf(spectrums, win_len=4):
-    M, F, T = spectrums.shape
-    rtf_complex = torch.zeros((M-1, F, T), dtype=torch.complex64)
-    win_len = win_len or T
-
-    for m in range(M-1):
-        for f in range(F):        
-            for t_idx in range(T):
-                t_start = max(0 , (t_idx-win_len))
-                t_end = min(T , (t_idx+win_len))
-                Xf = spectrums[0,f,t_start:t_end].reshape(1,-1)
-                Xs = spectrums[m+1,f,t_start:t_end].reshape(-1,1)
-                rtf_complex[m, f, t_idx] = (Xf @ Xs)/(Xf @ Xf.T)
-
-    rtf = torch.cat([torch.stack((rtf_complex[i].real, rtf_complex[i].imag), dim=0) for i in range(rtf_complex.shape[0])], dim=0)
-    return rtf
+    
 
 def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
     all_spectra = []
@@ -70,7 +50,7 @@ def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
 
     speakers = list(reversed(get_speakers_from_path(path[:-3])))
 
-    F, T = spectrum_shape_tuple
+    T, F = spectrum_shape_tuple
 
     labels = torch.full((cfg.max_num_of_speakers, T), torch.nan)
 
@@ -106,9 +86,10 @@ def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
         all_spectra.append(signal_power.median())
 
     for speaker_idx in range(len(speakers)):
+        pre_to_sig_ratio = cfg.pre_speech_noise_time / cfg.sample_length_secs
         doa_start, doa_end = doas[speaker_idx]
 
-        doa_map = torch.linspace(doa_start, doa_end, labels.shape[1]) # Since we assume uniform speed in the simulation
+        doa_map = torch.linspace(doa_start, doa_end, int(labels.shape[1] * (1 + pre_to_sig_ratio)))[int(labels.shape[1]*pre_to_sig_ratio):] # Since we assume uniform speed in the simulation
 
         labels[speaker_idx] = doa_map
 
