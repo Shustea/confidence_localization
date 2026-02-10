@@ -15,31 +15,32 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch
     tensor = tensor.detach()
     bound = bound.detach()
 
+    time_axis = np.arange(label.shape[-1])
+
     plt.figure()
-    plt.plot(label, torch.rad2deg(torch.abs(tensor - label)), label='error', color='red')
+    plt.plot(time_axis, torch.rad2deg(torch.abs(tensor - label)), label='error', color='red')
     plt.xlabel('Actual DOA [radians]')
     plt.ylabel('Error At Direction [deg]')
     plt.suptitle('Angle error at target DOA')
     plt.title(title)
     plt.legend()
-    plt.grid()
+    plt.grid(True)
 
     # Save the image
     plt.savefig(path + 'error_plot_of_' + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
     plt.close()
 
-    time_axis = np.arange(label.shape[-1])
-
     plt.figure()
     plt.plot(time_axis, tensor, label='Estimation', color='blue')
     plt.plot(time_axis, tensor + bound, label='Estimation Bound', color='cyan')
-    plt.plot(time_axis, tensor - bound, label='Estimation Bound', color='cyan')
+    plt.plot(time_axis, tensor - bound, color='cyan')
     plt.plot(time_axis, label, label='GT', color='red')
     plt.suptitle('Estimation angle (with bounds) compared to Ground Truth')
     plt.title(title)
     plt.xlabel('Time [frames]')
     plt.ylabel('Azimuth [radians]')
     plt.legend()
+    plt.grid(True)
 
     # Save the image
     plt.savefig(path + 'azimuth_plot_of_'+ filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
@@ -52,6 +53,7 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch
     plt.xlabel('Time [frames]')
     plt.ylabel('error bound [degrees]')
     plt.legend()
+    plt.grid(True)
 
     # Save the image
     plt.savefig(path + 'bound_plot_of_'+ filename, bbox_inches='tight', pad_inches=0.1, dpi=300)

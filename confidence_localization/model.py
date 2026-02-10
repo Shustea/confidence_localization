@@ -6,358 +6,68 @@ from torchvision.models import densenet121
 from einops import rearrange, repeat, einsum
 from scipy.special import i0, i0e
 
-class ChannelCNN(nn.Module):
-    def __init__(self, receivers_num=9, out_channels=1):
-        super(ChannelCNN, self).__init__()
-        channel_num = 2 * (receivers_num - 1)
-
-        self.channel_conv = nn.Sequential(
-            nn.Conv2d(channel_num, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Conv2d(32, out_channels, kernel_size=1)
-        )
-    def forward(self, x):
-        return self.channel_conv(x).permute(0, -2, -1 ,1)
-
-class MambaBlock(nn.Module):
-    def __init__(self, input_dim, hidden_dim, receivers_num):
-        super(MambaBlock, self).__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        
-        self.dt_rank = int(ceil(self.hidden_dim / 8))
-        # self.dt_rank = self.hidden_dim
-
-        #Define NN
-
-        self.in_projection = nn.Linear(input_dim, 2 * self.hidden_dim, bias=False)
-
-        self.conv1d = nn.Conv1d(self.hidden_dim, self.hidden_dim,
-                                 kernel_size=2*(receivers_num - 1)-1, 
-                                 groups=self.hidden_dim,
-                                 padding=2*(receivers_num - 1)-2 #casual
-        )
-
-        self.x_projection = nn.Linear(
-            self.hidden_dim,
-            self.hidden_dim * 2 + self.dt_rank,
-            bias=False
-        )
-
-        self.delta_t_projection = nn.Linear(
-            self.dt_rank, 
-            self.input_dim, 
-            bias=True
-        )
-
-        # State-space model parameters
-
-        self.A_log = nn.Parameter(
-            torch.log(repeat(
-            torch.arange(1, input_dim + 1, dtype=torch.float32),
-            'n -> n d', d=hidden_dim
-        )), 
-            requires_grad=True
-        )
-
-        self.D = nn.Parameter(
-            torch.ones(self.hidden_dim, dtype=torch.float32),
-            requires_grad=True
-        )
-
-        self.out_projection = nn.Linear(
-            self.hidden_dim, input_dim, bias=False
-        )
-
-        # self.initialization()
-
-    # def initialization(self):
-    #     nn.init.xavier_uniform_(self.A)
-
-    def ssm(self, x):
-        d, n = self.A_log.shape
-
-        # Compute state space parameters
-        A = -torch.exp(self.A_log) # shape -> (d_in, n)
-        D = self.D.float()
-
-        x_dbl = self.x_projection(x)  # shape -> (batch, input, seq_len)
-
-        delta, B, C = torch.split(
-            x_dbl, 
-            [self.dt_rank, self.hidden_dim, self.hidden_dim], 
-            dim=-1
-        )
-
-        delta = F.softplus(self.delta_t_projection(delta))  # shape -> (batch, seq_len, model_internal_dim)
-
-        return selective_scan(x, delta, A, B, C, D)
-        
-    def forward(self, x):
-        if len(x.shape) < 3:
-            x = x.unsqueeze(0)
-        seq_len = x.shape[-2]
-
-        x_and_res = self.in_projection(x)
-        x, res = torch.split(x_and_res, [self.hidden_dim, self.hidden_dim], dim=-1)
-
-        x = rearrange(x, 'b l n -> b n l')
-        x = self.conv1d(x)[:, :, :seq_len]
-        x = rearrange(x, 'b n l -> b l n')
-
-        x = F.silu(x)  # Equivalent to tf.nn.swish
-        y = self.ssm(x)
-        y = y * F.silu(res)
-
-        return self.out_projection(y)
-
-def complex_log(input, eps=1e-12):
-    eps = input.new_tensor(eps)
-    real = input.abs().maximum(eps).log()
-    imag = (input < 0).to(input.dtype) * torch.pi
-    return torch.complex(real, imag)
-
-def selective_scan(u, dt, A, B, C, D, mode='cumsum'):
-    dA = torch.einsum('bld,dn->bldn', dt, A)
-    dB_u = torch.einsum('bld,bln,bln->bldn', dt, u, B)
-    # dA = dA.clamp(min=-20)
-    
-    padding =  (0, 0, 0, 0, 1, 0)
-
-    if mode=='cumsum':            
-        dA_cumsum = F.pad(dA[:, 1:], padding).cumsum(1).exp()
-        x = dB_u / (dA_cumsum + 1e-12)
-        x = x.cumsum(1) * dA_cumsum
-        y = torch.einsum('bldn,bln->bln', x, C)
-    
-    elif mode=='logcumsumexp':  # more numerically stable (Heisen sequence)
-        dB_u_log = complex_log(dB_u)
-        dA_star = F.pad(dA[:, 1:].cumsum(1), padding)
-        x_log = torch.logcumsumexp(dB_u_log - dA_star, 1) + dA_star
-        y = torch.einsum('bldn,bln->bln', x_log.real.exp() * torch.cos(x_log.imag), C)
-            
-    return y + u * D
-    
-
-class RMSNorm(nn.Module):
-    def __init__(self,
-                 d_model: int,
-                 eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model))
-
-
-    def forward(self, x):
-        output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
-
-        return output
-    
-
-class ResidualBlock(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.layer = MambaBlock(cfg.input_dim, cfg.hidden_dim, cfg.recivers_num)
-        self.norm = RMSNorm(cfg.input_dim)
-
-    def forward(self, x):
-        return self.norm(self.layer(x)) + x
-    
-    
-class UNet1D(nn.Module):
-    def __init__(self, in_channels=257, out_channels=2, base_features=64):
-        """
-        1D U-Net.
-        
-        Args:
-            in_channels  (int): Number of input channels.
-            out_channels (int): Number of output channels (e.g., 2 for doa/logvar).
-            base_features(int): Number of feature maps in the first encoder layer.
-        """
-        super(UNet1D, self).__init__()
-
-        self.enc1 = self.double_conv(in_channels, base_features)
-        self.pool1 = nn.MaxPool1d(kernel_size=2, stride=2)
-
-        self.enc2 = self.double_conv(base_features, base_features * 2)
-        self.pool2 = nn.MaxPool1d(kernel_size=2, stride=2)
-
-        # we can extend the U-Net depth by adding more encoders/pools.
-        # For brevity, let's keep it two-level here.
-
-        self.bottleneck = self.double_conv(base_features * 2, base_features * 4)
-
-        self.up2 = nn.ConvTranspose1d(
-            base_features * 4, base_features * 2, kernel_size=2, stride=2, output_padding=1
-        )
-        self.dec2 = self.double_conv(base_features * 4, base_features * 2)
-
-        self.up1 = nn.ConvTranspose1d(
-            base_features * 2, base_features, kernel_size=2, stride=2
-        )
-        self.dec1 = self.double_conv(base_features * 2, base_features)
-
-        self.out_conv = nn.Conv1d(base_features, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        """
-        Forward pass of the 1D U-Net.
-        x shape: (batch_size, in_channels, seq_len)
-        """
-        e1 = self.enc1(x)         
-        p1 = self.pool1(e1)       
-
-        e2 = self.enc2(p1)        
-        p2 = self.pool2(e2)       
-
-        b = self.bottleneck(p2)   
-
-        u2 = self.up2(b)          
-        c2 = torch.cat([u2, e2], dim=1)  
-        d2 = self.dec2(c2)       
-
-        u1 = self.up1(d2)         
-        c1 = torch.cat([u1, e1], dim=1)
-        d1 = self.dec1(c1)        
-
-        out = self.out_conv(d1)
-        return out
-    
-    def double_conv(self, in_ch, out_ch):
-        """
-        for Unet
-        """
-        return nn.Sequential(
-            nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-        )
-    
-class UNet2D(nn.Module):
-    def __init__(self, in_channels=6, out_channels=2, base_features=64):
-        """
-        2D U-Net.
-        
-        Args:
-            in_channels  (int): Number of input channels.
-            out_channels (int): Number of output channels (e.g., 2 for doa/logvar).
-            base_features(int): Number of feature maps in the first encoder layer.
-        """
-        super(UNet2D, self).__init__()
-
-        self.enc1 = self.double_conv(in_channels, base_features)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        self.enc2 = self.double_conv(base_features, base_features * 2)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        # we can extend the U-Net depth by adding more encoders/pools.
-        # For brevity, let's keep it two-level here.
-
-        self.bottleneck = self.double_conv(base_features * 2, base_features * 4)
-
-        self.up2 = nn.ConvTranspose2d(
-            base_features * 4,
-            base_features * 2, 
-            kernel_size=2, 
-            stride=2, 
-            output_padding=(1, 0)
-        )
-        self.dec2 = self.double_conv(base_features * 4, base_features * 2)
-
-        self.up1 = nn.ConvTranspose2d(
-            base_features * 2, 
-            base_features, 
-            kernel_size=2, 
-            stride=2, 
-            output_padding=(0, 1)
-        )
-        self.dec1 = self.double_conv(base_features * 2, base_features)
-
-        self.out_conv = nn.Conv2d(base_features, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        """
-        Forward pass of the 2D U-Net.
-        x shape: (batch_size, in_channels, height, width)
-        """
-        e1 = self.enc1(x)         
-        p1 = self.pool1(e1)       
-
-        e2 = self.enc2(p1)        
-        p2 = self.pool2(e2)       
-
-        b = self.bottleneck(p2)   
-
-        u2 = self.up2(b)          
-        c2 = torch.cat([u2, e2], dim=1)  
-        d2 = self.dec2(c2)       
-
-        u1 = self.up1(d2)         
-        c1 = torch.cat([u1, e1], dim=1)
-        d1 = self.dec1(c1)        
-
-        out = self.out_conv(d1)
-        return out
-    
-    def double_conv(self, in_ch, out_ch):
-        """
-        for Unet
-        """
-        return nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-        )
-    
-class FeatureEncoder(nn.Module):
-    def __init__(self, receivers_num=4, dilation=2):
-        super(FeatureEncoder, self).__init__()
-        
-        self.pre_conv = nn.Sequential(
-            nn.Conv2d(2*(receivers_num-1), 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU()
-        )
-
-        densenet = densenet121(pretrained=False)
-        
-        densenet.features[0] = nn.Conv2d(64, 64, kernel_size=7, stride=2, padding=dilation, dilation=dilation, bias=False)
-
-        for module in densenet.features:
-            if isinstance(module, nn.Conv2d):
-                module.dilation = (dilation, dilation)
-                module.padding = (dilation, dilation)
-
-        self.dense_core = densenet.features
-
-        self.post_conv = nn.Sequential(
-            nn.Conv2d(1024, 1, kernel_size=1),
-            nn.BatchNorm2d(1),
-            nn.ReLU()
-        )
-
-    def forward(self, x):
-        x = self.pre_conv(x)
-        return x
-    
-
 ## Loss functions ##
+
+TAU_68 = 0.6827
+
+def ang_wrap(x):
+    return (x + torch.pi) % (2 * torch.pi) - torch.pi
+
+def ang_err_from_unit(doa_unit, labels):
+    mu = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
+    d = ang_wrap(labels - mu)
+    return d
+
+def weights(labels, vad=None):
+    w = torch.isfinite(labels).float()
+    return w if vad is None else w * vad.float()
+
+def safe_denom(w):
+    return w.sum().clamp_min(1.0)
+
+def pinball(u, tau):
+    return torch.maximum(tau * u, (tau - 1.0) * u)
+
+def soft_indicator(x, tau):
+    return torch.sigmoid(x / tau)
 
 def gaussian_loss(mean_err_squared, log_std, log_var_weight=1):
     return (0.5 * (mean_err_squared * torch.exp(-log_std)) + (log_var_weight * log_std)).mean() 
+
+def hetero_gaussian_nll_err(err, log_var, weights=None, min_log_var=-10.0, max_log_var=5.0):
+    lv = log_var.clamp(min_log_var, max_log_var)
+    inv_var = (-lv).exp()
+    loss = 0.5 * (err.pow(2) * inv_var + lv)
+    if weights is not None: loss = loss * weights
+    return loss.mean()
+
+import math
+
+def kappa_to_circ_std(kappa, eps=1e-12):
+    R = (torch.special.i1e(kappa) / torch.special.i0e(kappa)).clamp(eps, 1-eps)
+    return torch.sqrt(-2.0 * torch.log(R))
+
+def vm_nll_calibrated(err, kappa_raw, alpha, mask=None, lam=0.1, p=0.68, tau=0.05, kappa_max=200., eps=1e-12):
+    k = F.softplus(kappa_raw).clamp(eps, kappa_max)
+    a = torch.exp(alpha).clamp(1e-3, 1e3)
+    k = (a * k).clamp(eps, kappa_max)
+
+    nll = -k*torch.cos(err) + math.log(2*math.pi) + (torch.log(torch.special.i0e(k) + eps) + k)
+
+    sigma = kappa_to_circ_std(k, eps)
+    cov = torch.sigmoid((sigma - err.detach().abs()) / tau)  # detach so calib tunes kappa, not mean
+
+    if mask is not None:
+        nll = nll * mask
+        cov = cov * mask
+        denom = mask.sum() + eps
+        nll = nll.sum() / denom
+        cov = cov.sum() / denom
+    else:
+        nll = nll.mean()
+        cov = cov.mean()
+
+    return nll + lam * (cov - p).pow(2)
 
 def von_mises_loss(mean_err_squared, log_std, log_var_weight=1):
     angle_error = torch.sqrt(mean_err_squared).clamp(0, torch.pi)
@@ -367,3 +77,73 @@ def von_mises_loss(mean_err_squared, log_std, log_var_weight=1):
     log_I0 = torch.log(torch.i0(kappa) + 1e-8)
     nll = -(kappa * torch.cos(angle_error) - log_I0) + log_var_weight * log_kappa # von Mises NLL: -log(I0(kappa)) - kappa * cos(error)
     return nll.mean()
+
+def kappa_to_circ_std(kappa, eps=1e-12):
+    kappa = torch.clamp(kappa, min=eps)
+    R = (torch.special.i1e(kappa) / torch.special.i0e(kappa)).clamp(eps, 1-eps)
+    return torch.sqrt(-2.0 * torch.log(R))
+
+def halfnormal_loss(error, bound, weights, sigma_min=1e-3, sigma_max=1e9):
+    """
+    Used for estimating the DOA as a Wrapped-Gaussian Distribiution
+    """
+    sigma = (F.softplus(bound) + sigma_min).clamp_max(sigma_max)
+    nll = torch.log(sigma) + 0.5 * (error / sigma).pow(2)
+
+    return (nll * weights).sum() / weights.sum()
+
+
+def pinball_loss(error, bound, weights, q=TAU_68):
+    """
+    Used for quantile regression
+    """
+
+    assert 0.0 < q < 1.0, q
+    assert torch.isfinite(weights).all()
+    assert (weights >= 0).all(), (weights.min().item(), weights.max().item())
+
+    U = error - bound
+    L = torch.maximum(q*U, (q-1)*U)
+    return (L * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def kappa_loss(error, bound, weights, kappa_min=1e-3, kappa_max=1e3):
+    """
+    Used for estimating the DOA as a Von-Misus Distribiution
+    """
+    d = ang_wrap(error)
+
+    kappa = (F.softplus(bound) + kappa_min).clamp_max(kappa_max)
+    logI0 = kappa + torch.log(i0e(kappa) + 1e-12)
+    
+    nll = -kappa * torch.cos(d) + (torch.log(torch.tensor(2.0 * torch.pi, device=kappa.device, dtype=kappa.dtype)) + logI0)
+    return (nll * weights).sum() / weights.sum()
+
+
+def bound_loss(error, bound, weights, p=TAU_68, temp=0.02):
+    """
+    Used to approximate the upper-bound of the error
+    """
+    b = F.softplus(bound)
+    cover = soft_indicator(b - error, temp)
+    c = (cover * weights).sum()
+
+    return (c - p).pow(2)
+
+
+def bound_loss_rank(error, bound, weights):
+    """
+    Used to force correlation so frame with 
+    larger error get higher bound
+    """
+    weights = weights.reshape(-1) > 0
+
+    b = F.softplus(bound).reshape(-1)
+
+    error = error.reshape(-1)[weights] 
+    b = b[weights]
+
+    p = torch.randperm(error.numel(), device=error.device)
+    s = torch.sign(error - error[p])
+
+    return F.softplus(-s * (b - b[p])).mean()

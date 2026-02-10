@@ -104,7 +104,9 @@ class DOAMAMBA(pl.LightningModule):
         self.cfg = cfg
         self.strict_loading = False
 
-        self.negative_log_likelihood_func = [gaussian_loss if cfg.nnl_func == 'gaussian' else von_mises_loss if cfg.nnl_func == 'von_mises' else None][0]
+        self.alpha = torch.nn.Parameter(torch.zeros(()))
+
+        # self.negative_log_likelihood_func = [gaussian_loss if cfg.nnl_func == 'gaussian' else von_mises_loss if cfg.nnl_func == 'von_mises' else None][0]
         
         self.mamba_layers = nn.Sequential(*[
             MambaResCTF(cfg, expand)
@@ -118,11 +120,8 @@ class DOAMAMBA(pl.LightningModule):
             nn.Tanh()  # output in [-1, 1]
         )
 
-        self.log_std = nn.Sequential(
-            nn.Linear(cfg.input_dim, 1),
-            nn.Tanh()  # output in [-1, 1]
-        )
-
+        self.hidden_bound = nn.Linear(cfg.d_model, 1)
+        self.kappa =  nn.Linear(cfg.input_dim, 1)
         
         self.reset_parameters()
 
@@ -130,11 +129,12 @@ class DOAMAMBA(pl.LightningModule):
         init.xavier_uniform_(self.hidden.weight)
         init.zeros_(self.hidden.bias)
 
-        # init.xavier_uniform_(self.doa.weight)
-        # init.zeros_(self.doa.bias)
+        init.xavier_uniform_(self.hidden_bound.weight)
+        init.zeros_(self.hidden_bound.bias)
 
-        # init.xavier_uniform_(self.log_std.weight)
-        # init.zeros_(self.log_std.bias)
+        init.xavier_uniform_(self.kappa.weight)
+        init.zeros_(self.kappa.bias)
+
 
     def forward(self, x):
         x = x.permute(0, -1, 2, 1).contiguous()
@@ -143,17 +143,29 @@ class DOAMAMBA(pl.LightningModule):
             x = block(F.normalize(x, dim=-1))
 
         x_hat = F.gelu(self.hidden(F.normalize(x, dim=-1)).squeeze(-1)).permute(0, 2, 1)
+        x_bound_hat = F.tanh(self.hidden_bound(F.normalize(x, dim=-1)).squeeze(-1)).permute(0, 2, 1)
+        
         doa_vec = self.doa(x_hat)
-        return F.normalize(doa_vec, dim=-1), self.log_std(x_hat)
-    
+        doa_unit = F.normalize(doa_vec, dim=-1)
+
+        kappa = F.softplus(self.kappa(x_bound_hat).squeeze(-1)) + float(getattr(self.cfg, "bound_min", 1e-3))
+        return doa_unit, kappa
+        
     def circ_error(self, angle):
         return ((angle + torch.pi) % (2 * torch.pi) - torch.pi).abs()
 
-    def accuracy(self, est, gt, var=0.1):
+    def accuracy(self, est, gt, std=0.1):
         valid = ~torch.isnan(gt)
-        if torch.numel(var) > 1:
-            var = var[valid]
-        return torch.sum(self.circ_error(est.unsqueeze(1)[valid] - gt[valid]) < var) / torch.sum(valid)
+        if torch.numel(std) > 1:
+            std = std[valid]
+        return torch.mean((self.circ_error(est.unsqueeze(1)[valid] - gt[valid]) < std).float())
+    
+    @torch.no_grad()
+    def calibrate_scale(err, base_std, target=0.68):
+        # err, base_std: same shape, already masked (no NaNs)
+        s = torch.logspace(-2, 2, 400, device=err.device)
+        cov = (err[:,None] < (s[None,:] * base_std[:,None])).float().mean(dim=0)
+        return s[(cov - target).abs().argmin()]
     
     def _sanitize(self, doa_vec, log_std):
         log_std = log_std.squeeze(-1)
@@ -190,16 +202,8 @@ class DOAMAMBA(pl.LightningModule):
     def _temporal_regularization(self, doa_vec):
         return torch.linalg.norm(torch.diff(doa_vec, dim=-1))
 
-    def _noise_regularizer(self, log_std, chosen_mask, device, dtype):
-        noise_mask = ~chosen_mask
-        noise_logstd = log_std[noise_mask]
-        noise_logstd = noise_logstd[torch.isfinite(noise_logstd)]
-        if noise_logstd.numel():
-            target_min = getattr(self.cfg, "noise_logstd_min", 0.0)
-            return F.relu(target_min - noise_logstd).mean()
-        return torch.tensor(0.0, device=device, dtype=dtype)
 
-    def loss(self, doa_vec, log_std, labels, batch_idx, vad=None):
+    def loss(self, doa_vec, kappa, labels, batch_idx, vad=None):
         pred = F.normalize(doa_vec, dim=-1)
         tgt = torch.stack((labels.cos(), labels.sin()), dim=-1)
 
@@ -215,7 +219,7 @@ class DOAMAMBA(pl.LightningModule):
         loss_main = (per * w).sum() / denom
 
         mae = torch.acos(cos.clamp(-0.999999, 0.999999))
-        mae = (mae * w).sum().detach() / denom
+        mae = (mae * w)
 
         lam = float(getattr(self.cfg, "temporal_reg_factor", 0.0))
         if lam > 0 and pred.shape[1] > 1:
@@ -224,17 +228,27 @@ class DOAMAMBA(pl.LightningModule):
             tv = (pred[:, 1:] - pred[:, :-1]).norm(dim=-1)
             loss_main = loss_main + lam * (tv * w2).sum() / denom2
 
-        return loss_main, mae, None
-    
+        # total_loss = loss_main
+        # total_loss = pinball_loss(per, bound, w) + 0.1 * bound_loss_rank(per, bound, w)
+        error = ang_err_from_unit(pred, labels)
+        total_loss = vm_nll_calibrated(error, kappa, self.alpha)
+        # + (self.accuracy(torch.atan2(doa_vec[..., 1], doa_vec[..., 0]),
+        #                                                                 labels.unsqueeze(1),
+        #                                                                 kappa_to_circ_std(kappa).unsqueeze(1))
+        #                                                                   - 0.68).pow(2)
+
+        return total_loss, mae.sum().detach() / denom, None
+
     def training_step(self, batch,  batch_idx):
         spectrum, labels, _ = batch
 
-        doa, log_std = self(spectrum)
+        doa, kappa = self(spectrum)
         
-        train_loss, mae, _ = self.loss(doa, log_std, labels, batch_idx)
+        train_loss, mae, _ = self.loss(doa, kappa, labels, batch_idx)
 
         self.log("train_loss", train_loss.mean(), on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
         self.log("train_mae", mae.mean(), on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
+        self.log("cal_alpha", self.alpha, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
 
         return train_loss.to(dtype=torch.float32)
 
@@ -243,25 +257,21 @@ class DOAMAMBA(pl.LightningModule):
         spectrum, labels, title = batch
         B = spectrum.size(0)
 
-        doa_unit, log_std = self(spectrum)
+        doa_unit, kappa = self(spectrum)
+        circ_std = kappa_to_circ_std(self.alpha.exp() * kappa)
 
         doa     = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
 
         if batch_idx == 0 and labels.size(0) > 1:
-            save_sample_as_image(doa[1].cpu(), labels[1].cpu(), 0.01*torch.ones(doa[1].shape).cpu(), title=f'{labels[1][0]}->{labels[1][-1]}', filename="DOA_1_example.png")
-            # if ~torch.isnan(labels[1, 1].cpu()).any():
-            #     save_sample_as_image(doa[1].cpu(), labels[1, 1].cpu(), 0.01*torch.ones(doa[1].shape).cpu(), title=f'{labels[1, 1][0]}->{labels[1, 1][-1]}', filename="DOA_2_example.png")
+            save_sample_as_image(doa[1].cpu(), labels[1].cpu(), circ_std[1].cpu(), title=f'{labels[1][0]}->{labels[1][-1]}', filename="DOA_1_example.png")
 
-        val_loss, mae, best_spk = self.loss(doa_unit, log_std, labels, batch_idx)
+        val_loss, mae, best_spk = self.loss(doa_unit, kappa, labels, batch_idx)
 
         ref = labels[torch.arange(B, device=labels.device), best_spk]
         ang10  = self.accuracy(doa, ref, torch.tensor(deg2rad(10.0)))
         ang15  = self.accuracy(doa, ref, torch.tensor(deg2rad(15.0)))
-        angStd = self.accuracy(doa, ref, torch.tensor(deg2rad(5.0)))
-
-        # spk_mask  = ~ref.isnan()
-        # std_spk   = std[spk_mask].mean()
-        # std_noise = std[~spk_mask].mean()
+        angStd = self.accuracy(doa, ref, circ_std.unsqueeze(1))
+        angBound = self.accuracy(doa, ref, (1/kappa.rsqrt()).unsqueeze(1))
 
         self.log_dict(
             {
@@ -270,9 +280,10 @@ class DOAMAMBA(pl.LightningModule):
                 "validation_accuracy_10":  ang10.mean(),
                 "validation_accuracy_15":  ang15.mean(),
                 "validation_accuracy_std": angStd.mean(),
-                # "mean_std_over_speakers":  std_spk,
-                # "mean_std_over_noise":     std_noise,
-                "mean_MAE_over_speakers":  mae.mean(),
+                "validation_accuracy_std_err": torch.abs(angStd.mean() - 0.68),
+                "validation_accuracy_bound":  angBound.mean(),
+                # "mean_std_over_noise":     std_noise
+                "cal_alpha" : self.alpha
             },
             on_epoch=True,
             sync_dist=True,
@@ -283,17 +294,24 @@ class DOAMAMBA(pl.LightningModule):
         return {"val_loss": val_loss.mean(), "val_acc": ang10.mean()}
 
     def configure_optimizers(self):
-        # Use Adam optimizer
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
-        scheduler = {
-        'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min'),
-        'monitor': 'train_loss'
-        }
-        return {'optimizer': optimizer, 'scheduler': scheduler}
+        opt = torch.optim.AdamW(
+            (p for p in self.parameters() if p.requires_grad),
+            lr=self.cfg.lr,
+            weight_decay=0.0
+        )
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min")
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "monitor": "train_loss"}}
     
     def on_load_checkpoint(self, ckpt):
         ckpt.pop("optimizer_states", None)
         ckpt.pop("lr_schedulers", None)
+
+    def train_logstd_only(self):
+        for p in self.parameters(): p.requires_grad = False
+        
+        for p in self.kappa.parameters(): p.requires_grad = True
+        for p in self.hidden_bound.parameters(): p.requires_grad = True
+        self.alpha.requires_grad = True
         
 
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
@@ -310,6 +328,7 @@ def main(cfg):
     ckpt = cfg.resume_from_checkpoint if ("resume_from_checkpoint" in cfg.keys()) else None
     if ckpt:
         model = DOAMAMBA.load_from_checkpoint(ckpt, cfg=cfg, strict=False)
+        model.train_logstd_only()
 
     checkpoint_loss_callback = ModelCheckpoint(
     monitor="validation_loss",  # Monitor validation loss
@@ -329,7 +348,7 @@ def main(cfg):
     )
 
     checkpoint_acc_callback_std = ModelCheckpoint(
-        monitor="validation_accuracy_std",
+        monitor="validation_accuracy_std_err",
         dirpath="./models/",
         filename="best-accstd-{epoch:02d}-{validation_accuracy_std:.2f}",
         save_top_k=2,

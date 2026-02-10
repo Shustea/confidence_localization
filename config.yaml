@@ -14,8 +14,8 @@ resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2026-01-18/
 train_size : 5400
 val_size : 600
 
-batch_size: 8
-num_workers: 8
+batch_size: 16
+num_workers: 0
 
 preprocessed_data_flag : True
 
@@ -73,16 +73,17 @@ layers : [2, 4, 4, 4]
 res_alpha : 0.1
 log_var_weight : 1
 
-lr : 5e-4
+lr : 1e-4
 weight_decay: 1e-5
-epochs: 300
+epochs: 100
 regularization_constant : 1e-6
 temporal_reg_factor : 1e-4
 
 classification : False
 logvar_confidence_on_noise: False
 # nnl_func : 'von_mises'
-nnl_func : 'gaussian'
+bound_loss_func : 'von_mies'
+sigma_min : 1e-3
 error_bound_on_mse : 180
 
 
