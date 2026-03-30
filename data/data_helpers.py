@@ -11,10 +11,17 @@ import warnings
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
 def compute_nb_img(room_sz, Tmax, c=340):
+    """Estimate how many time the audio signal is reflected within the room."""
     max_dist = c * Tmax
     return np.ceil(max_dist / np.array(room_sz)).astype(int)
 
 def mix_signal(args):
+    """Generate one synthetic multichannel mixture and return both the waveform and its sample identifier.
+
+    Example:
+        Output: ``mixed_signal`` with shape ``[T, M]`` and a filename-safe id
+        string encoding source motion, gain, beta, and noise type.
+    """
     snr = np.random.uniform(args.snr_db - 3, args.snr_db + 3)
 
     speakers_dirs = get_speaker_dirs(args.wav_path)
@@ -33,9 +40,11 @@ def mix_signal(args):
     return mixed_signal, mix_id
 
 def get_speaker_dirs(wav_path):
+    """List speaker subdirectories available under the configured waveform root."""
     return [d for d in os.listdir(wav_path) if os.path.isdir(os.path.join(wav_path, d))]
 
 def sample_non_overlapping_doa(first_doa, min_sep=np.deg2rad(25), max_iter=100):
+    """Sample an azimuth that stays at least the requested separation away from a reference azimuth."""
     for _ in range(max_iter):
         doa = np.random.uniform(0, 2 * np.pi)
         if np.abs(np.angle(np.exp(1j*(doa - first_doa)))) > min_sep:
@@ -43,11 +52,18 @@ def sample_non_overlapping_doa(first_doa, min_sep=np.deg2rad(25), max_iter=100):
 
 def choose_start_offset(sample_length, min_overlap=0.3, max_overlap=0.7):
     # force overlap only for part of the utterance
+    """Choose a start offset that enforces a partial-overlap range for two utterances."""
     overlap_fraction = np.random.uniform(min_overlap, max_overlap)
     max_start = int(sample_length * (1 - overlap_fraction))
     return np.random.randint(0, max_start)
 
 def generate_speaker_sample(args, speakers_dirs, beta):
+    """Load one utterance, place it in the simulated room, and render the moving-speaker sample.
+
+    Example:
+        Output: ``sample`` with shape ``[T + pre_noise, M]``, ``sample_id``
+        encoding start and end azimuth, and ``sp_path`` with shape ``[T, 3]``.
+    """
     sample_length = int(args.sample_length_secs * args.fs)
     sample_time = args.sample_length_secs
     speaker_id = np.random.choice(speakers_dirs)
@@ -81,6 +97,13 @@ def generate_speaker_sample(args, speakers_dirs, beta):
     return sample, id_string, sp_path
 
 def generate_second_speaker_sample(args, speakers_dirs, first_id, first_sample, beta, doa_range):
+    """Render an additional speaker sample that avoids the first speaker's DOA region.
+
+    Example:
+        Output: a second multichannel sample with the same shape as
+        ``first_sample`` and an id string whose leading value stores the applied
+        gain factor.
+    """
     sample_length = int(args.sample_length_secs * args.fs)
     sample_time = args.sample_length_secs
     remaining = [s for s in speakers_dirs if s not in first_id]
@@ -206,6 +229,7 @@ def add_diffuse_noise(signal, args, beta, print_stats=False):
 import numpy as np
 
 def pinknoise(N, seed=None):
+    """Generate a unit-variance pink-noise sequence of the requested length."""
     rng = np.random.default_rng(seed)
     Nfft = int(2 ** np.ceil(np.log2(N)))
     X = rng.normal(size=Nfft // 2 + 1) + 1j * rng.normal(size=Nfft // 2 + 1)
@@ -218,6 +242,13 @@ def pinknoise(N, seed=None):
     return x
 
 def add_pink_noise(x, sp_path, cfg, snr_db=35):
+    """Render pink noise through the room simulator and scale it to the requested SNR.
+
+    Example:
+        Input: ``x`` with shape ``[T, M]``.
+        Output: ``signal_w_noise`` with the same shape and a tag like
+        ``"pink_noise_35db"`` describing the target SNR.
+    """
     noise = pinknoise(x.shape[1])
 
     noise_placement, _ = sample_noise_positions(cfg, sp_path=sp_path)
@@ -252,6 +283,7 @@ def add_pink_noise(x, sp_path, cfg, snr_db=35):
     return signal_w_noise, f'pink_noise_{snr_db}db'
 
 def pad_or_trim(signal, target_length):
+    """Pad or crop a waveform so it matches the requested target length."""
     if len(signal.shape) == 1:
         padded = np.zeros(target_length)
     else:
@@ -261,6 +293,13 @@ def pad_or_trim(signal, target_length):
     return padded
 
 def apply_rir_on_sample(src, args, start_pos, distance, angular_speed, length, beta):
+    """Render a moving source through the room simulator and return the multichannel output and source path.
+
+    Example:
+        Input: a mono source ``src`` of length ``length`` and one 3D start point.
+        Output: ``rendered`` with shape ``[length, M]`` plus ``s_path`` with
+        shape ``[length, 3]`` tracing the source position over time.
+    """
     fs = args.fs
     mic_positions = np.array(args.receivers_coords)  # (M,3)
     room_dim = np.array(args.room_dim)
@@ -314,6 +353,7 @@ def apply_rir_on_sample(src, args, start_pos, distance, angular_speed, length, b
     return np.array(result.output), s_path
 
 def generate_ar_noise(order, coef, size, loc=0.0, scale=1e-4, burn_in=None):
+    """Generate autoregressive noise from the provided coefficients."""
     rng = np.random.default_rng()
     eps = rng.normal(loc, scale, size + (burn_in or 0))
     ar = eps.copy()
@@ -322,12 +362,14 @@ def generate_ar_noise(order, coef, size, loc=0.0, scale=1e-4, burn_in=None):
     return ar[-size:]
 
 def _as_vec3(x, name):
+    """Coerce an input into a length-3 floating-point vector."""
     a = np.asarray(x, dtype=float).reshape(-1)
     if a.size != 3:
         raise ValueError(f"{name} must be length-3, got shape {np.asarray(x).shape}")
     return a
 
 def _as_mat3(x, name):
+    """Coerce an input into a floating-point array with shape ``(*, 3)``."""
     a = np.asarray(x, dtype=float)
     a = np.atleast_2d(a)
     if a.shape[-1] != 3:
@@ -336,6 +378,13 @@ def _as_mat3(x, name):
 
 def sample_noise_positions(cfg, LL=None, rp=None, sp_path=None, J=None,
                            d_rp=None, d_sp=None, margin=None, batch=None, max_iter=None):
+    """Sample valid room positions for noise sources while respecting microphone and source-distance margins.
+
+    Example:
+        Output: ``positions`` with shape ``[J, 3]`` when sampling succeeds, plus
+        a boolean flag indicating whether all ``J`` positions were found before
+        hitting ``max_iter``.
+    """
     LL = _as_vec3(LL if LL is not None else cfg.room_dim, "LL")
     rp = _as_mat3(rp if rp is not None else cfg.receivers_coords, "rp")
     J  = int(J if J is not None else cfg.J)
@@ -375,3 +424,108 @@ def sample_noise_positions(cfg, LL=None, rp=None, sp_path=None, J=None,
                 break
 
     return P, (P.shape[0] == J)
+
+
+
+### Auxilery Datasets for test ###
+from pathlib import Path
+import re, pandas as pd, numpy as np, torch
+import soundfile as sf
+from torch.utils.data import Dataset, DataLoader
+
+def _read_audio(path):
+    """Read an audio file and return a channel-first float tensor with its sample rate."""
+    x, fs = sf.read(str(path), always_2d=True)
+    return torch.from_numpy(x.T.astype(np.float32)), fs  # [C,T]
+
+class RealMAN(Dataset):
+    def __init__(self, root, split, mode, chs, noisy=False):
+        """Initialize the RealMAN evaluation dataset wrapper."""
+        self.root = Path(root)
+        self.split, self.mode, self.chs = split, mode, list(chs)
+        folder = "ma_noisy_speech" if noisy else "ma_speech"
+        csv = self.root/split/f"{split}_{mode}_source_location.csv"
+        self.gt = pd.read_csv(csv)
+        self.base = self.root/split/folder
+        # build sample keys from existing file tree by using gt rows
+        self.rows = self.gt.to_dict("records")
+
+    def __len__(self):
+        """Return the number of RealMAN metadata rows available for the selected split."""
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        """Load one RealMAN sample, align the requested channels, and package waveform, labels, and metadata.
+
+        Example:
+            Output keys: ``wav``, ``fs``, ``y``, ``vad``, and ``meta``.
+            ``wav`` has shape ``[len(chs), L]`` and ``y`` stores azimuth alone or
+            azimuth/elevation depending on the CSV columns.
+        """
+        r = self.rows[i]
+        # be robust to header differences (RealMAN updated fields)  [oai_citation:6‡GitHub](https://github.com/Audio-WestlakeU/RealMAN)
+        scene = r.get("scene") or r.get("Scene") or r.get("scene_name")
+        spk   = int(r.get("speakerId") or r.get("speaker_id") or r.get("speaker"))
+        utt   = int(r.get("utteranceId") or r.get("utterance_id") or r.get("utterance"))
+        tag   = {"moving":"M","static":"S"}[self.mode]
+        split_tag = {"train":"TRAIN","val":"VAL","test":"TEST"}[self.split]
+        scene_short = r.get("scene_short") or r.get("scene_id") or None
+
+        # If CSV doesn't provide the short scene code used in filenames, infer it from files present.
+        # simplest: search within the speaker folder and match speaker/utt + _CH0.
+        spk_dir = self.base/scene/self.mode/f"{spk:04d}"
+        if scene_short is None:
+            m = next(spk_dir.glob(f"{split_tag}_{tag}_*_{spk:04d}_{utt:04d}_CH0.flac")).name
+            scene_short = m.split("_")[2]
+
+        stem = f"{split_tag}_{tag}_{scene_short}_{spk:04d}_{utt:04d}"
+        xs = []
+        for c in self.chs:
+            x, fs = _read_audio(spk_dir/f"{stem}_CH{c}.flac")
+            xs.append(x[0])
+        L = min(map(len, xs))
+        wav = torch.stack([x[:L] for x in xs], 0)
+
+        az = r.get("azimuth") or r.get("azi") or r.get("Azimuth")
+        el = r.get("elevation") if "elevation" in r else None
+        y = torch.tensor([float(az)], dtype=torch.float32) if el is None else torch.tensor([float(az), float(el)], dtype=torch.float32)
+
+        return {"wav": wav, "fs": fs, "y": y, "vad": None, "meta": {"scene": scene, "speaker": spk, "utt": utt}}
+
+class LOCATA(Dataset):
+    def __init__(self, root, task, recording, array, chs, source_name=None):
+        """Initialize the LOCATA evaluation dataset wrapper."""
+        self.root = Path(root)
+        self.task, self.recording, self.array = int(task), int(recording), array
+        self.chs = list(chs)
+        rec_dir = self.root/f"task{self.task}"/f"recording{self.recording}"/self.array
+        self.wav_path = rec_dir/f"audio_array_{self.array}.wav"  # per docs  [oai_citation:7‡LOCATA](https://www.locata.lms.tf.fau.de/files/2020/01/Documentation_LOCATA_final_release_V1.pdf)
+
+        # pick a source gt file (single-source tasks: choose first if not specified)
+        gt = sorted(rec_dir.glob("position_source_*.txt"))
+        self.pos_path = next(p for p in gt if source_name in p.name) if source_name else gt[0]  # per docs  [oai_citation:8‡LOCATA](https://www.locata.lms.tf.fau.de/files/2020/01/Documentation_LOCATA_final_release_V1.pdf)
+
+        # optional VAD
+        vad = sorted(rec_dir.glob(f"VAD_{self.array}_*.txt"))
+        self.vad_path = vad[0] if vad else None
+
+    def __len__(self):
+        """Return the number of LOCATA recordings exposed by this wrapper."""
+        return 1
+
+    def __getitem__(self, _):
+        """Load the configured LOCATA recording, source positions, and optional VAD annotations.
+
+        Example:
+            Output keys: ``wav``, ``fs``, ``y``, ``vad``, and ``meta``.
+            ``wav`` has shape ``[len(chs), T]`` and ``y`` keeps the raw source
+            position table loaded from ``position_source_*.txt``.
+        """
+        x, fs = _read_audio(self.wav_path)
+        wav = x[self.chs]
+        # you’ll parse position_source_* to your label format (azimuth, unit vec, etc.)
+        pos = np.loadtxt(self.pos_path, ndmin=2)
+        y = torch.from_numpy(pos.astype(np.float32))  # keep raw; convert later
+
+        vad = torch.from_numpy(np.loadtxt(self.vad_path).astype(np.float32)).bool() if self.vad_path else None
+        return {"wav": wav, "fs": fs, "y": y, "vad": vad, "meta": {"task": self.task, "recording": self.recording, "array": self.array}}

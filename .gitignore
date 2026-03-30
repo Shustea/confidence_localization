@@ -14,6 +14,7 @@
 /.vscode
 /dockerfile
 /pyproject.toml
+/CODEX.md
 
 #submodel
 /rir-generator

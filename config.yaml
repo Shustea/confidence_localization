@@ -1,96 +1,216 @@
-train_path: "/workspaces/confidence_localization/data/processed/train/"
-val_path: "/workspaces/confidence_localization/data/processed/validation/"
-test_path: "/workspaces/confidence_localization/data/processed/test/"
-rir_bank_path: "/workspaces/confidence_localization/data/interim/rir_bank/"
-target_path: "/workspaces/confidence_localization/data/processed/target/"
-wav_path: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
-log_dir: "/workspaces/confidence_localization/logs/DOAMAMBA"
-save_dir: "/workspaces/confidence_localization/models/"
+paths:
+  synthetic:
+    train: "/workspaces/confidence_localization/data/processed/train/"
+    val: "/workspaces/confidence_localization/data/processed/validation/"
+    test: "/workspaces/confidence_localization/data/processed/test/"
+    rir_bank: "/workspaces/confidence_localization/data/interim/rir_bank/"
+    target: "/workspaces/confidence_localization/data/processed/target/"
+    wav_root: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
+  datasets:
+    realman: "/workspaces/confidence_localization/data/raw"
+    locata: "/workspaces/confidence_localization/data/raw/locata"
+  caches:
+    realman: "/workspaces/confidence_localization/data/processed/test/RealMAN"
+    locata: "/workspaces/confidence_localization/data/processed/test/LOCATA"
+  outputs:
+    logs: "/workspaces/confidence_localization/logs"
+    models: "/workspaces/confidence_localization/models"
+    samples: "/workspaces/confidence_localization/samples"
+    tmp: "/workspaces/confidence_localization/tmp"
 
-default_gpu : 7
+train_path: ${paths.synthetic.train}
+val_path: ${paths.synthetic.val}
+test_path: ${paths.synthetic.test}
+rir_bank_path: ${paths.synthetic.rir_bank}
+target_path: ${paths.synthetic.target}
+wav_path: ${paths.synthetic.wav_root}
+realman_root: ${paths.datasets.realman}
+locata_root: ${paths.datasets.locata}
+realman_target: ${paths.caches.realman}
+locata_target: ${paths.caches.locata}
+log_dir: ${paths.outputs.logs}
+save_dir: ${paths.outputs.models}
+sample_dir: ${paths.outputs.samples}
 
+default_gpu: 7
 resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2026-01-18/21-35-46/models/best-acc10-epoch=116-validation_accuracy_10=0.91.ckpt"
 
-train_size : 5400
-val_size : 600
-
+train_size: 5400
+val_size: 600
 batch_size: 16
 num_workers: 0
+preprocessed_data_flag: true
 
-preprocessed_data_flag : True
-
-num_noise_sources : 6
-
-pre_speech_noise_time : 2
-max_num_of_speakers : 1
-delete_all_samples_flag: False
+num_noise_sources: 6
+pre_speech_noise_time: 2
+max_num_of_speakers: 1
+delete_all_samples_flag: false
 sample_length_secs: 8
-min_sep : 25
-# possible_heights: [1.65, 1.675, 1.7, 1.725, 1.75, 1.775, 1.8, 1.825, 1.85]
-# possible_heights: [1.75]
+min_sep: 25
 room_dim: [5, 5, 2.6]
 receivers_coords:
   - [2.500, 2.500, 0.750]
   - [2.550, 2.500, 0.750]
   - [2.500, 2.550, 0.750]
-  - [2.450, 2.500, 0.750] 
-  - [2.500, 2.450, 0.750]   
+  - [2.450, 2.500, 0.750]
+  - [2.500, 2.450, 0.750]
 
-J : 1 #amount of pink noise sources
-
-src_height : 1.75
-
+J: 1
+src_height: 1.75
 sound_velocity: 340
-hop : 32
-order : -1
-beta : 0.34
+hop: 32
+order: -1
+beta: 0.34
 nsample: 2048
 p_silence: 0.0
 p_one: 1
-p_movement : 0.5
-dominance_threshold : 0.6
-min_overlap : 0.3
-max_overlap : 0.9
-snr_db : 20
-
-recivers_num : 5
+p_movement: 0.5
+dominance_threshold: 0.6
+min_overlap: 0.3
+max_overlap: 0.9
+snr_db: 20
+recivers_num: 5
 
 fs: 16000
-nfft : 1024
-win_len : 8
-overlap : 0.75
-exp_window_smoothing : 0.9
-
+nfft: 1024
+win_len: 8
+overlap: 0.75
+exp_window_smoothing: 0.9
 eps: 1e-6
 
-input_dim : 1024
-d_model : 4
-freq_dim : 1024
-time_dim : 376
-hidden_dim : 64
-conv_dim : 4
-layers : [2, 4, 4, 4]
-res_alpha : 0.1
-log_var_weight : 1
+input_dim: 1024
+d_model: 4
+freq_dim: 1024
+time_dim: 376
+hidden_dim: 64
+conv_dim: 4
+layers: [2, 4, 4, 4]
+res_alpha: 0.1
+log_var_weight: 1
 
-lr : 1e-4
+lr: 1e-4
 weight_decay: 1e-5
 epochs: 100
-regularization_constant : 1e-6
-temporal_reg_factor : 1e-4
+regularization_constant: 1e-6
+temporal_reg_factor: 1e-4
 
-classification : False
-logvar_confidence_on_noise: False
-# nnl_func : 'von_mises'
-bound_loss_func : 'von_mies'
-sigma_min : 1e-3
-error_bound_on_mse : 180
+classification: false
+logvar_confidence_on_noise: false
+bound_loss_func: "von_mises"
+sigma_min: 1e-3
+error_bound_on_mse: 180
 
+ar_coef: 0.9
+ar_order: 1
+initial_warmup: 0
+warmup: 300
+noise_beta: 0
 
-ar_coef : 0.9
-ar_order : 1
+precompute:
+  external_stages: [eval]
+  overwrite: false
 
-initial_warmup : 0
-warmup : 300
+data:
+  train:
+    source: synthetic
+    loader:
+      batch_size: ${batch_size}
+      num_workers: ${num_workers}
+      pin_memory: true
+    synthetic:
+      root: ${train_path}
+    realman:
+      root: ${realman_root}
+      split: train
+      mode: moving
+      use_noisy: false
+      channels: [0, 3, 5, 7, 1]
+      every_nth: 1
+      max_items: null
+      feature_mode: realtime
+      cache_root: "${paths.caches.realman}/train"
+      overwrite_cache: false
+    locata:
+      root: ${locata_root}
+      split: dev
+      task: 1
+      recording: 6
+      array: eigenmike
+      channels: [4, 10, 6, 1, 19]
+      source_name: null
+      feature_mode: realtime
+      cache_root: "${paths.caches.locata}/train"
+      overwrite_cache: false
+  val:
+    source: synthetic
+    loader:
+      batch_size: ${batch_size}
+      num_workers: ${num_workers}
+      pin_memory: true
+    synthetic:
+      root: ${val_path}
+    realman:
+      root: ${realman_root}
+      split: val
+      mode: moving
+      use_noisy: true
+      channels: [0, 3, 5, 7, 1]
+      every_nth: 1
+      max_items: null
+      feature_mode: realtime
+      cache_root: "${paths.caches.realman}/val"
+      overwrite_cache: false
+    locata:
+      root: ${locata_root}
+      split: dev
+      task: 1
+      recording: 6
+      array: eigenmike
+      channels: [4, 10, 6, 1, 19]
+      source_name: null
+      feature_mode: realtime
+      cache_root: "${paths.caches.locata}/val"
+      overwrite_cache: false
+  eval:
+    source: realman
+    loader:
+      batch_size: 1
+      num_workers: 0
+      pin_memory: true
+    synthetic:
+      root: ${val_path}
+    realman:
+      root: ${realman_root}
+      split: val
+      mode: moving
+      use_noisy: true
+      channels: [0, 3, 5, 7, 1]
+      every_nth: 1
+      max_items: null
+      feature_mode: realtime
+      cache_root: "${paths.caches.realman}/eval"
+      overwrite_cache: false
+    locata:
+      root: ${locata_root}
+      split: dev
+      task: 1
+      recording: 6
+      array: eigenmike
+      channels: [4, 10, 6, 1, 19]
+      source_name: null
+      feature_mode: realtime
+      cache_root: "${paths.caches.locata}/eval"
+      overwrite_cache: false
 
-noise_beta : 0
+eval:
+  checkpoint_path: ${resume_from_checkpoint}
+  device: auto
+  device_index: ${default_gpu}
+  tmp_dir: ${paths.outputs.tmp}
+  plot_dir: ${sample_dir}
+  max_plots: 3
+  max_batches: null
+
+hydra:
+  job:
+    chdir: false

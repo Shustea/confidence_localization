@@ -7,6 +7,11 @@ from torch.jit import script
 
 def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch.Tensor, filename: str, title=None, path='/workspaces/confidence_localization/samples/'):
     # Ensure tensor is on CPU and detach if it's a computation graph tensor
+    """Save diagnostic plots for DOA estimates, confidence bounds, and framewise error.
+
+    Example:
+        >>> save_sample_as_image(doa, labels, bound, "example.png", title="validation")
+    """
     tensor = tensor.squeeze()
     
     tensor = tensor.cpu()
@@ -62,6 +67,7 @@ def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch
 def gevd(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Tensor:
 
     # torch doesn't have gevd solver so well whiten the cov matrices
+    """Solve the generalized eigenvalue problem and normalize the principal eigenvector by the reference channel."""
     L = torch.linalg.cholesky(Rv)
     L_inv = torch.linalg.inv(L)
     Rs_white = L_inv @ Rs @ L_inv.conj().T
@@ -80,6 +86,7 @@ def gevd(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Tensor
 
 @script
 def cholesky(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Tensor:
+    """Estimate the principal relative transfer function by whitening with the noise covariance."""
     L = torch.linalg.cholesky(Rv)
     L_inv = torch.linalg.inv(L)
 
@@ -97,6 +104,7 @@ def cholesky(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Te
 
 
 def energy_vad(x, fs, frame_ms=20, hop_ms=10, alpha=4, win_sec=1):
+    """Compute a simple energy-based voice activity detector with hangover smoothing."""
     frame = int(frame_ms*fs/1000)
     hop   = int(hop_ms*fs/1000)
     W     = int(win_sec*1000/hop_ms)
@@ -114,9 +122,19 @@ def energy_vad(x, fs, frame_ms=20, hop_ms=10, alpha=4, win_sec=1):
 
 
 def estimate_cov_batched(X):
+    """Estimate covariance matrices for a batch of complex observations."""
     return (X @ X.conj().transpose(-2, -1)) / X.shape[-1]
 
 def estimate_rtf(cfg, spectrums, epsilon=0.01):
+    """Estimate relative transfer function features from multichannel STFT data.
+
+    Example:
+        Input: ``spectrums`` with shape ``[M, F, T]`` where ``M`` is the number
+        of microphones.
+        Output: an RTF feature tensor with shape ``[M - 1, Ts, 2 * (K - 1)]``,
+        where ``Ts`` is the number of post-noise time frames and ``K`` is the
+        retained number of frequency bins.
+    """
     M, F, T = spectrums.shape
     device, cdtype = spectrums.device, spectrums.dtype
 
@@ -177,6 +195,14 @@ def estimate_rtf(cfg, spectrums, epsilon=0.01):
     return torch.fft.ifftshift(reir_matrix, dim=0).permute(2,1,0)
 
 def rtf_to_reir(rtf, F_L=None, F_R=None):
+    """Convert RTF features back into time-domain relative impulse responses.
+
+    Example:
+        Input: ``rtf`` with shape ``[M, K, T]``.
+        Output: ``reir`` with shape ``[M, 2 * (K - 1), T]`` where each slice
+        stores the reconstructed relative impulse response for one channel and
+        time frame.
+    """
     M, K, T = rtf.shape
     rtf_np = rtf.cpu().numpy()
     nfft = 2*(K-1)
@@ -196,32 +222,29 @@ def rtf_to_reir(rtf, F_L=None, F_R=None):
 
     return torch.from_numpy(reir)
 
-def compute_multichannel_stft(signal: np.ndarray, cfg):
-    """
-    compute stft for every channel across a file - make sure the input is channels x time
-    """
-    M, T = signal.shape
-    if type(signal) != torch.Tensor:
-        signal_tensor = torch.tensor(signal)
-    else:
-        signal_tensor = signal
-    window = torch.hamming_window(cfg.nfft, periodic=True)
+def compute_multichannel_stft(signal, cfg):
+    """Compute a multichannel STFT using the project window and overlap settings.
 
-    stft_list = []
-    for mic_idx in range(M):
-        stft_mic = torch.stft(
-            signal_tensor[mic_idx],
-            n_fft=cfg.nfft,
-            hop_length=int(cfg.nfft * (1 - cfg.overlap)),
-            return_complex=True,
-            window=window
-        )
-        stft_list.append(stft_mic)
-
-    stft_tensor = torch.stack(stft_list, dim=0)
-    return stft_tensor
+    Example:
+        Input: a waveform tensor with shape ``[M, N]``.
+        Output: a complex STFT tensor with shape ``[M, F, T]`` where
+        ``F = cfg.nfft // 2 + 1``.
+    """
+    if not isinstance(signal, torch.Tensor): signal = torch.tensor(signal)
+    window = torch.hamming_window(cfg.nfft, periodic=True, device=signal.device)
+    x = signal.reshape(-1, signal.shape[-1])
+    X = torch.stft(x, n_fft=cfg.nfft, hop_length=int(cfg.nfft*(1-cfg.overlap)),
+                   return_complex=True, window=window)
+    return X.reshape(signal.shape[0], *X.shape[1:])
 
 def compute_multichannel_istft(signal: np.ndarray, cfg):
+    """Reconstruct time-domain signals from a multichannel STFT-like array.
+
+    Example:
+        Input: ``signal`` with shape ``[T, F, M]``.
+        Output: a tensor with shape ``[M, N]`` containing one reconstructed
+        waveform per microphone channel.
+    """
     T, _, M = signal.shape
     signal_tensor = torch.from_numpy(signal).float()
     signal_tensor = signal_tensor.permute(2, 0, 1).squeeze(-1)

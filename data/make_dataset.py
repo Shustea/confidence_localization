@@ -1,7 +1,6 @@
 import librosa
 import shutil
 import numpy as np
-import soundfile as sf
 from tqdm import tqdm
 import subprocess
 import torch
@@ -16,15 +15,39 @@ import hydra
 import sys
 
 import matplotlib.pyplot as plt
+from pathlib import Path
+import torch, soundfile as sf
+
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from confidence_localization.util import compute_multichannel_stft, estimate_rtf
 from data_helpers import mix_signal
+from eval_utils import (
+    build_locata_labels,
+    build_realman_labels,
+    cache_file_path,
+    limit_records,
+    load_locata_waveform,
+    load_realman_metadata,
+    load_realman_waveform,
+    preprocess_waveform,
+    save_cached_sample,
+)
 
 MAX_CORES_FOR_PREPROCESS = 8
+
+
+def _cfg_get(node, key, default=None):
+    if node is None:
+        return default
+    if isinstance(node, dict):
+        return node.get(key, default)
+    if hasattr(node, "get"):
+        value = node.get(key, default)
+        return default if value is None else value
+    return getattr(node, key, default)
 
 
 def convert_wv12wav(args):
@@ -35,6 +58,7 @@ def convert_wv12wav(args):
     # Basically this function is just a WV1->WAV converter
     
 
+    """Convert WSJ0 `.wv1` files into `.wav` files under the configured raw-data directory."""
     if args.delete_all_samples_flag:
         if os.path.exists(args.wav_path):
             confirm = input(
@@ -65,6 +89,13 @@ def convert_wv12wav(args):
 
 
 def preprocess_file(cfg, sample_file):
+        """Load one waveform or cached tensor and convert waveforms into RTF features when needed.
+
+        Example:
+            Input: a ``.wav`` file holding multichannel audio or an existing ``.pt`` tensor.
+            Output: either the cached tensor directly or a newly computed RTF tensor
+            with shape compatible with the training dataloader.
+        """
         if sample_file.split('.')[-1] == 'pt':
             signal = torch.load(sample_file)
         elif sample_file.split('.')[-1] == 'wav':
@@ -78,13 +109,11 @@ def preprocess_file(cfg, sample_file):
         if np.isnan(signal).sum() > 0:
             raise ValueError(f"NaNs detected in wav : {sample_name}")
 
-        stft = compute_multichannel_stft(signal, cfg)
-        rtf = estimate_rtf(cfg, stft)
-        # return torch.cat([torch.stack((rtf[i].real, rtf[i].imag), dim=0) for i in range(rtf.shape[0])], dim=0)
-        return rtf
+        return preprocess_wave(cfg, signal)
 
 
 def process_and_save(cfg, path, file):
+    """Preprocess a single waveform file and save the resulting `.pt` features next to it."""
     try:
         full = os.path.join(path, file)
         if full.endswith('wav'):
@@ -97,6 +126,7 @@ def process_and_save(cfg, path, file):
 
 
 def is_real_wav(path):
+    """Check whether a file has a valid RIFF/WAVE header."""
     try:
         with open(path, "rb") as f:
             header = f.read(12)
@@ -106,6 +136,7 @@ def is_real_wav(path):
 
 
 def fix_directory(root):
+    """Repair mislabeled cached feature files inside a directory tree."""
     for dirpath, _, files in os.walk(root):
         for f in files:
             full = os.path.join(dirpath, f)
@@ -140,9 +171,11 @@ def fix_directory(root):
 
 
 def preprocess(cfg):
+    """Precompute RTF features for the configured train and validation directories in parallel."""
     print('--- Performing GEVD for all data in parallel ---')
 
     def process_path(path):
+        """Handle path."""
         files = os.listdir(path)
         with ProcessPoolExecutor(max_workers=MAX_CORES_FOR_PREPROCESS) as executor:
             futures = [executor.submit(process_and_save, cfg, path, file) for file in files]
@@ -160,6 +193,7 @@ def preprocess(cfg):
 
 
 def _count_pt_or_wav(dir_path):
+    """Count cached feature or waveform files in a directory."""
     if not os.path.isdir(dir_path):
         return 0
     return sum(1 for f in os.listdir(dir_path) if (f.endswith(".pt") or f.endswith(".wav")))
@@ -238,6 +272,7 @@ def create_data(cfg):
 
 
 def fix_ptpt_files(directory):
+    """Delete accidental `.pt.pt` duplicates from a directory."""
     for filename in tqdm(os.listdir(directory)):
         if filename.endswith('.pt.pt'):
             full_path = os.path.join(directory, filename)
@@ -246,15 +281,137 @@ def fix_ptpt_files(directory):
             except Exception as e:
                 print(f"Failed to delete {filename}: {e}")
 
+                
+def preprocess_wave(cfg, wav, sample_rate=None):
+    """Convert a multichannel waveform tensor into the raw cached RTF representation."""
+    if torch.isnan(wav).any():
+        raise ValueError("NaNs in wav")
+    return preprocess_waveform(cfg, wav, sample_rate=sample_rate, normalize=False)
+
+
+def save_pt(out_path, tensor):
+    """Save a tensor to disk, creating parent directories as needed."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    torch.save(tensor.cpu(), out_path)
+
+
+def _external_stage_cfg(cfg, stage):
+    data_cfg = _cfg_get(cfg, "data")
+    return _cfg_get(data_cfg, stage) if data_cfg is not None else None
+
+
+def realman_make_cache(cfg, dataset_cfg, overwrite=False):
+    """Precompute and cache RealMAN samples as raw RTF tensors plus labels/title sidecars."""
+    root = _cfg_get(dataset_cfg, "root", _cfg_get(cfg, "realman_root"))
+    split = _cfg_get(dataset_cfg, "split", "val")
+    mode = _cfg_get(dataset_cfg, "mode", "moving")
+    use_noisy = bool(_cfg_get(dataset_cfg, "use_noisy", True))
+    channels = list(_cfg_get(dataset_cfg, "channels", _cfg_get(dataset_cfg, "chs", [0, 1])))
+    every_nth = _cfg_get(dataset_cfg, "every_nth", 1)
+    max_items = _cfg_get(dataset_cfg, "max_items", None)
+    cache_root = _cfg_get(dataset_cfg, "cache_root", _cfg_get(cfg, "realman_target"))
+
+    frame = load_realman_metadata(root, split, mode)
+    rows = limit_records(frame.to_dict("records"), every_nth=every_nth, max_items=max_items)
+    os.makedirs(cache_root, exist_ok=True)
+
+    for idx, row in enumerate(tqdm(rows, desc=f"realman:{split}:{mode}")):
+        title = Path(str(row["filename"])).stem
+        out_path = cache_file_path(cache_root, idx, title)
+        if out_path.exists() and not overwrite:
+            continue
+
+        wav, sample_rate, title = load_realman_waveform(root, row, channels, use_noisy=use_noisy)
+        feat = preprocess_wave(cfg, wav, sample_rate=sample_rate)
+        labels = build_realman_labels(row, feat.shape[1])
+        save_cached_sample(
+            out_path,
+            feat,
+            labels,
+            title,
+            meta={"source": "realman", "split": split, "mode": mode, "use_noisy": use_noisy, "channels": channels},
+            overwrite=overwrite,
+        )
+
+
+def locata_make_cache(cfg, dataset_cfg, overwrite=False):
+    """Precompute and cache one LOCATA recording as a raw RTF tensor plus labels/title sidecars."""
+    root = _cfg_get(dataset_cfg, "root", _cfg_get(cfg, "locata_root"))
+    split = _cfg_get(dataset_cfg, "split", "dev")
+    task = int(_cfg_get(dataset_cfg, "task", 1))
+    recording = int(_cfg_get(dataset_cfg, "recording", 1))
+    array = _cfg_get(dataset_cfg, "array", "eigenmike")
+    channels = list(_cfg_get(dataset_cfg, "channels", _cfg_get(dataset_cfg, "chs", [0, 1])))
+    source_name = _cfg_get(dataset_cfg, "source_name", None)
+    cache_root = _cfg_get(dataset_cfg, "cache_root", _cfg_get(cfg, "locata_target"))
+
+    os.makedirs(cache_root, exist_ok=True)
+    title = f"locata_task{task}_rec{recording}_{array}"
+    out_path = cache_file_path(cache_root, 0, title)
+    if out_path.exists() and not overwrite:
+        return
+
+    wav, sample_rate, title, _ = load_locata_waveform(root, split, task, recording, array, channels)
+    feat = preprocess_wave(cfg, wav, sample_rate=sample_rate)
+    labels = build_locata_labels(root, split, task, recording, array, feat.shape[1], source_name=source_name)
+    save_cached_sample(
+        out_path,
+        feat,
+        labels,
+        title,
+        meta={"source": "locata", "split": split, "task": task, "recording": recording, "array": array, "channels": channels},
+        overwrite=overwrite,
+    )
+
+
+def preprocess_external(cfg):
+    """Precompute cached external-dataset features for the configured stages."""
+    precompute_cfg = _cfg_get(cfg, "precompute", {})
+    stages = _cfg_get(precompute_cfg, "external_stages", ["eval"])
+    seen = set()
+
+    for stage in stages:
+        stage_cfg = _external_stage_cfg(cfg, str(stage))
+        if stage_cfg is None:
+            print(f"[precompute] missing stage config: {stage}")
+            continue
+
+        source = str(_cfg_get(stage_cfg, "source", "synthetic")).lower()
+        if source not in {"realman", "locata"}:
+            print(f"[precompute] skipping stage '{stage}' because source='{source}'")
+            continue
+
+        dataset_cfg = _cfg_get(stage_cfg, source, stage_cfg)
+        cache_root = _cfg_get(dataset_cfg, "cache_root", None)
+        key = (source, str(cache_root))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        overwrite = bool(_cfg_get(dataset_cfg, "overwrite_cache", _cfg_get(precompute_cfg, "overwrite", False)))
+        if source == "realman":
+            realman_make_cache(cfg, dataset_cfg, overwrite=overwrite)
+        else:
+            locata_make_cache(cfg, dataset_cfg, overwrite=overwrite)
+
+
+def preprocess_test(cfg):
+    """Backward-compatible alias for external feature precomputation."""
+    preprocess_external(cfg)
+
 
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
-def main(cfg, convert_wv12wav_flag=False, create_data_flag=True, preprocess_flag=True):
+def main(cfg, convert_wv12wav_flag=False, create_data_flag=False, preprocess_flag=False, preprocess_test_flag=False, preprocess_external_flag=False):
+    """Serve as the Hydra entrypoint for waveform conversion, synthetic-data generation, and preprocessing tasks."""
     if convert_wv12wav_flag:
         convert_wv12wav(cfg)
     if create_data_flag:
         create_data(cfg)
     if preprocess_flag:
         preprocess(cfg)
+    if preprocess_test_flag or preprocess_external_flag:
+        preprocess_external(cfg)
+
 
 
 if __name__ == "__main__":

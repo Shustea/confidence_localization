@@ -1,3 +1,6 @@
 [submodule "rir-generator"]
 	path = rir-generator
 	url = https://github.com/audiolabs/rir-generator
+[submodule "RealMAN"]
+	path = RealMAN
+	url = https://github.com/Audio-WestlakeU/RealMAN
