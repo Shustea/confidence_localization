@@ -66,17 +66,32 @@ class CLDataset(Dataset):
 
 
 class CachedExternalDataset(Dataset):
-    def __init__(self, cache_root, transform=None, every_nth=1, max_items=None):
+    def __init__(self, cache_root, transform=None, every_nth=1, max_items=None, target_frames=None):
         self.transform = transform
+        self.target_frames = target_frames
         self.cache_files = list_cache_files(cache_root, every_nth=every_nth, max_items=max_items)
 
     def __len__(self):
         return len(self.cache_files)
 
+    def _pad_or_truncate(self, rtf, labels):
+        T = rtf.shape[1]
+        target = self.target_frames
+        if T > target:
+            start = torch.randint(0, T - target, (1,)).item()
+            rtf = rtf[:, start:start + target, :]
+            labels = labels[start:start + target]
+        elif T < target:
+            rtf = torch.nn.functional.pad(rtf, (0, 0, 0, target - T))
+            labels = torch.cat([labels, torch.full((target - T,), torch.nan)])
+        return rtf, labels
+
     def __getitem__(self, idx):
         rtf, labels, title = load_cached_sample(self.cache_files[idx])
         if labels is None:
             raise ValueError(f"Cached sample '{self.cache_files[idx]}' does not include labels.")
+        if self.target_frames is not None:
+            rtf, labels = self._pad_or_truncate(rtf, labels)
         return _apply_feature_pipeline(rtf, self.transform), labels, title
 
 
@@ -295,6 +310,14 @@ def _feature_mode(dataset_cfg):
     return str(_cfg_get(dataset_cfg, "feature_mode", "realtime")).lower()
 
 
+def _target_frames(cfg, dataset_cfg):
+    dur = _cfg_get(dataset_cfg, "target_duration_sec", None)
+    if dur is None:
+        return None
+    hop = int(_cfg_get(cfg, "nfft", 1024) * (1 - _cfg_get(cfg, "overlap", 0.75)))
+    return int(float(dur) * int(_cfg_get(cfg, "fs", 16000)) / hop)
+
+
 def _external_dataset(cfg, stage_cfg, source, transform=None):
     if source == "realman":
         dataset_cfg = _cfg_get(stage_cfg, "realman", stage_cfg)
@@ -304,6 +327,7 @@ def _external_dataset(cfg, stage_cfg, source, transform=None):
                 transform=transform,
                 every_nth=_cfg_get(dataset_cfg, "every_nth", 1),
                 max_items=_cfg_get(dataset_cfg, "max_items", None),
+                target_frames=_target_frames(cfg, dataset_cfg),
             )
         return RealMANDataset(cfg, dataset_cfg, transform=transform)
 
@@ -314,6 +338,7 @@ def _external_dataset(cfg, stage_cfg, source, transform=None):
             transform=transform,
             every_nth=_cfg_get(dataset_cfg, "every_nth", 1),
             max_items=_cfg_get(dataset_cfg, "max_items", None),
+            target_frames=_target_frames(cfg, dataset_cfg),
         )
     return LOCATADataset(cfg, dataset_cfg, transform=transform)
 

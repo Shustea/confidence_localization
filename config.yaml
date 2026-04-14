@@ -1,17 +1,20 @@
+data_root: "/workspaces/confidence_localization/data/lab"
+dataset_name: "1spk_6pink_snr20dB_5ch"
+
 paths:
   synthetic:
-    train: "/workspaces/confidence_localization/data/processed/train/"
-    val: "/workspaces/confidence_localization/data/processed/validation/"
-    test: "/workspaces/confidence_localization/data/processed/test/"
-    rir_bank: "/workspaces/confidence_localization/data/interim/rir_bank/"
-    target: "/workspaces/confidence_localization/data/processed/target/"
-    wav_root: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
+    train: "${data_root}/processed/${dataset_name}/train/"
+    val: "${data_root}/processed/${dataset_name}/validation/"
+    test: "${data_root}/processed/${dataset_name}/test/"
+    rir_bank: "${data_root}/interim/rir_bank/"
+    target: "${data_root}/processed/${dataset_name}/target/"
+    wav_root: "${data_root}/raw/WSJ0_raw/"
   datasets:
-    realman: "/workspaces/confidence_localization/data/raw"
-    locata: "/workspaces/confidence_localization/data/raw/locata"
+    realman: "${data_root}/data/raw/RealMAN"
+    locata: "${data_root}/data/raw/locata"
   caches:
-    realman: "/workspaces/confidence_localization/data/processed/test/RealMAN"
-    locata: "/workspaces/confidence_localization/data/processed/test/LOCATA"
+    realman: "${data_root}/processed/${dataset_name}/test/RealMAN"
+    locata: "${data_root}/processed/${dataset_name}/test/LOCATA"
   outputs:
     logs: "/workspaces/confidence_localization/logs"
     models: "/workspaces/confidence_localization/models"
@@ -33,11 +36,11 @@ save_dir: ${paths.outputs.models}
 sample_dir: ${paths.outputs.samples}
 
 default_gpu: 7
-resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2026-01-18/21-35-46/models/best-acc10-epoch=116-validation_accuracy_10=0.91.ckpt"
+resume_from_checkpoint: false
 
 train_size: 5400
 val_size: 600
-batch_size: 16
+batch_size: 8
 num_workers: 0
 preprocessed_data_flag: true
 
@@ -81,7 +84,7 @@ eps: 1e-6
 input_dim: 1024
 d_model: 4
 freq_dim: 1024
-time_dim: 376
+time_dim: 188
 hidden_dim: 64
 conv_dim: 4
 layers: [2, 4, 4, 4]
@@ -90,9 +93,17 @@ log_var_weight: 1
 
 lr: 1e-4
 weight_decay: 1e-5
-epochs: 100
+lr_factor: 0.5       # ReduceLROnPlateau multiplicative factor
+lr_patience: 10      # epochs without val_loss improvement before LR is reduced
+lr_min: 1e-6         # floor for the learning rate
+early_stopping_patience: 25    # epochs without improvement before training stops
+early_stopping_min_delta: 1e-4 # minimum change in val_loss to count as improvement
+epochs: 200          # upper bound; early stopping will usually kick in before this
 regularization_constant: 1e-6
 temporal_reg_factor: 1e-4
+gradient_checkpointing: true   # set true to trade ~2x compute for ~4x less activation VRAM
+accumulate_grad_batches: 2      # increase to simulate larger batch with smaller batch_size
+train_mode: doa                 # "doa" = full model; "confidence" = freeze DOA, train bound head only
 
 classification: false
 logvar_confidence_on_noise: false
@@ -106,13 +117,23 @@ initial_warmup: 0
 warmup: 300
 noise_beta: 0
 
+tune:
+  n_trials: 30          # total Optuna trials
+  epochs: 20            # training epochs per trial (shorter than full training)
+  every_nth: 4          # subsample RealMAN data during search (1 = all, 4 = 25%)
+  study_name: doamamba
+  storage: "sqlite:///${paths.outputs.logs}/optuna_doamamba.db"
+
+make_dataset:
+  mode: synthetic   # synthetic | realman | all | convert_wsj0
+
 precompute:
-  external_stages: [eval]
+  external_stages: [train, val, eval]
   overwrite: false
 
 data:
   train:
-    source: synthetic
+    source: realman
     loader:
       batch_size: ${batch_size}
       num_workers: ${num_workers}
@@ -121,20 +142,21 @@ data:
       root: ${train_path}
     realman:
       root: ${realman_root}
-      split: train
+      split: test
       mode: moving
-      use_noisy: false
+      use_noisy: true
       channels: [0, 3, 5, 7, 1]
       every_nth: 1
       max_items: null
-      feature_mode: realtime
+      feature_mode: cached
       cache_root: "${paths.caches.realman}/train"
       overwrite_cache: false
+      target_duration_sec: 3
     locata:
       root: ${locata_root}
       split: dev
       task: 1
-      recording: 6
+      recording: 1
       array: eigenmike
       channels: [4, 10, 6, 1, 19]
       source_name: null
@@ -142,7 +164,7 @@ data:
       cache_root: "${paths.caches.locata}/train"
       overwrite_cache: false
   val:
-    source: synthetic
+    source: realman
     loader:
       batch_size: ${batch_size}
       num_workers: ${num_workers}
@@ -157,14 +179,15 @@ data:
       channels: [0, 3, 5, 7, 1]
       every_nth: 1
       max_items: null
-      feature_mode: realtime
+      feature_mode: cached
       cache_root: "${paths.caches.realman}/val"
       overwrite_cache: false
+      target_duration_sec: 3
     locata:
       root: ${locata_root}
       split: dev
       task: 1
-      recording: 6
+      recording: 1
       array: eigenmike
       channels: [4, 10, 6, 1, 19]
       source_name: null
@@ -194,7 +217,7 @@ data:
       root: ${locata_root}
       split: dev
       task: 1
-      recording: 6
+      recording: 1
       array: eigenmike
       channels: [4, 10, 6, 1, 19]
       source_name: null

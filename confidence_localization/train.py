@@ -1,9 +1,11 @@
+import warnings
+warnings.filterwarnings("ignore", message=".*torch.cuda.amp.*deprecated.*")
+
 from runtime_setup import configure_runtime
 
 configure_runtime(__file__)
 
 import hydra
-import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
@@ -12,18 +14,14 @@ import torch.utils.checkpoint as cp
 from einops import rearrange
 from mamba_ssm import Mamba
 from mamba_ssm.ops.selective_scan_interface import selective_scan_ref
-from model import *
-from numpy import arange, unique, deg2rad, floor
-from pytorch_lightning.callbacks import ModelCheckpoint
+from numpy import deg2rad
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
-from torch.nn.utils import clip_grad_norm_
-from torch.special import i0e
-from torchvision import transforms
 
 import confidence_localization_dataloader as cld
+from model import ang_err_from_unit, kappa_to_circ_std, vm_nll_calibrated
 from util import save_sample_as_image
-
 
 
 class CompatibleMamba(Mamba):
@@ -31,14 +29,18 @@ class CompatibleMamba(Mamba):
 
     def _reference_step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
-        assert hidden_states.shape[1] == 1, "Only support decoding with 1 token at a time for now"
+        assert (
+            hidden_states.shape[1] == 1
+        ), "Only support decoding with 1 token at a time for now"
 
         xz = self.in_proj(hidden_states.squeeze(1))
         x, z = xz.chunk(2, dim=-1)
 
         conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
         conv_state[:, :, -1] = x
-        x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
+        x = torch.sum(
+            conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
+        )
         if self.conv1d.bias is not None:
             x = x + self.conv1d.bias
         x = self.act(x).to(dtype=dtype)
@@ -87,7 +89,9 @@ class CompatibleMamba(Mamba):
 
         x = self.act(self.conv1d(x)[..., :seqlen])
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
-        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt, B, C = torch.split(
+            x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
         dt = self.dt_proj.weight @ dt.t()
         dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
@@ -111,17 +115,22 @@ class CompatibleMamba(Mamba):
         y = rearrange(y, "b d l -> b l d")
         return self.out_proj(y)
 
+
 class MambaResFreq(nn.Module):
     def __init__(self, cfg, expand=2):
         """Initialize the frequency-wise residual Mamba block."""
         super().__init__()
-        self.mamba = CompatibleMamba(d_model=cfg.d_model, d_state=cfg.hidden_dim, d_conv=cfg.conv_dim, expand=expand)
+        self.mamba = CompatibleMamba(
+            d_model=cfg.d_model,
+            d_state=cfg.hidden_dim,
+            d_conv=cfg.conv_dim,
+            expand=expand,
+        )
 
     def forward(self, x):
         """Apply the Mamba block across the time axis independently for each frequency bin."""
         B, Freq, T, d = x.shape
-        y = x.contiguous().view(B * Freq, T, d)
-        y = self.mamba(y).view(B, Freq, T, d)
+        y = self.mamba(x.reshape(B * Freq, T, d)).reshape(B, Freq, T, d)
         return x + y
 
 
@@ -129,13 +138,21 @@ class MambaResTime(nn.Module):
     def __init__(self, cfg, expand=2):
         """Initialize the time-wise residual Mamba block."""
         super().__init__()
-        self.mamba = CompatibleMamba(d_model=cfg.d_model, d_state=cfg.hidden_dim, d_conv=cfg.conv_dim, expand=expand)
+        self.mamba = CompatibleMamba(
+            d_model=cfg.d_model,
+            d_state=cfg.hidden_dim,
+            d_conv=cfg.conv_dim,
+            expand=expand,
+        )
 
     def forward(self, x):
         """Apply the Mamba block across the frequency axis independently for each time step."""
         B, Freq, T, d = x.shape
-        y = x.transpose(1, 2).contiguous().view(B * T, Freq, d)
-        y = self.mamba(y).view(B, T, Freq, d).transpose(1, 2)
+        y = (
+            self.mamba(x.transpose(1, 2).reshape(B * T, Freq, d))
+            .reshape(B, T, Freq, d)
+            .transpose(1, 2)
+        )
         return x + y
 
 
@@ -143,12 +160,14 @@ class MambaResChannel(nn.Module):
     def __init__(self, cfg, expand: int = 2):
         """Initialize the channel-mixing residual Mamba block."""
         super().__init__()
-        channels = (getattr(cfg, "receivers_num", None) or getattr(cfg, "recivers_num", None)) - 1
+        channels = (
+            getattr(cfg, "receivers_num", None) or getattr(cfg, "recivers_num", None)
+        ) - 1
         d_model = getattr(cfg, "d_model", channels)
         self.channels, self.d_model = channels, d_model
-        self.use_proj = (channels != d_model)
+        self.use_proj = channels != d_model
         if self.use_proj:
-            self.in_proj  = nn.Linear(channels, d_model)
+            self.in_proj = nn.Linear(channels, d_model)
             self.out_proj = nn.Linear(d_model, channels)
         self.norm = nn.LayerNorm(d_model)
         self.mamba = CompatibleMamba(
@@ -162,15 +181,16 @@ class MambaResChannel(nn.Module):
     def forward(self, x):
         """Project channel features if needed, run the Mamba mixer, and add the residual back."""
         B, F, T, C = x.shape
-        y = x.contiguous().view(B, F * T, C)
+        y = x.reshape(B, F * T, C)
         if self.use_proj:
             y = self.in_proj(y)
         y = self.mamba(self.norm(y))
         if self.use_proj:
             y = self.out_proj(y)
-        y = self.dropout(y).view(B, F, T, C)
+        y = self.dropout(y).reshape(B, F, T, C)
         return x + y
-    
+
+
 class MambaResTF(nn.Module):
     def __init__(self, cfg, expand=2):
         """Initialize the combined time-frequency residual block."""
@@ -182,7 +202,8 @@ class MambaResTF(nn.Module):
     def forward(self, x):
         """Apply the time and frequency residual mixers in sequence."""
         return self.mambaF(self.mambaT(x))
-    
+
+
 class MambaResCTF(nn.Module):
     def __init__(self, cfg, expand=2):
         """Initialize the composite channel-time-frequency residual block."""
@@ -193,6 +214,7 @@ class MambaResCTF(nn.Module):
     def forward(self, x):
         """Apply time-frequency mixing followed by channel mixing."""
         return self.mambaC(self.mambaTF(x))
+
 
 class DOAMAMBA(pl.LightningModule):
     def __init__(self, cfg):
@@ -205,22 +227,20 @@ class DOAMAMBA(pl.LightningModule):
         self.alpha = torch.nn.Parameter(torch.ones(()))
 
         # self.negative_log_likelihood_func = [gaussian_loss if cfg.nnl_func == 'gaussian' else von_mises_loss if cfg.nnl_func == 'von_mises' else None][0]
-        
-        self.mamba_layers = nn.Sequential(*[
-            MambaResCTF(cfg, expand)
-            for expand in cfg.layers
-        ])
+
+        self.mamba_layers = nn.Sequential(
+            *[MambaResCTF(cfg, expand) for expand in cfg.layers]
+        )
 
         self.hidden = nn.Linear(cfg.d_model, 1)
-        
+
         self.doa = nn.Sequential(
-            nn.Linear(cfg.input_dim, 2),
-            nn.Tanh()  # output in [-1, 1]
+            nn.Linear(cfg.input_dim, 2), nn.Tanh()  # output in [-1, 1]
         )
 
         self.hidden_bound = nn.Linear(cfg.d_model, 1)
-        self.kappa =  nn.Linear(cfg.input_dim, 1)
-        
+        self.kappa = nn.Linear(cfg.input_dim, 1)
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -234,7 +254,6 @@ class DOAMAMBA(pl.LightningModule):
         init.xavier_uniform_(self.kappa.weight)
         init.zeros_(self.kappa.bias)
 
-
     def forward(self, x):
         """Run the DOA model on an RTF batch and return a unit-vector direction estimate plus concentration.
 
@@ -245,18 +264,27 @@ class DOAMAMBA(pl.LightningModule):
         """
         x = x.permute(0, -1, 2, 1).contiguous()
 
+        use_ckpt = self.training and getattr(self.cfg, "gradient_checkpointing", False)
         for block in self.mamba_layers:
-            x = block(F.normalize(x, dim=-1))
+            x_norm = F.normalize(x, dim=-1)
+            x = (
+                cp.checkpoint(block, x_norm, use_reentrant=False)
+                if use_ckpt
+                else block(x_norm)
+            )
 
-        x_hat = F.gelu(self.hidden(F.normalize(x, dim=-1)).squeeze(-1)).permute(0, 2, 1)
-        x_bound_hat = F.tanh(self.hidden_bound(F.normalize(x, dim=-1)).squeeze(-1)).permute(0, 2, 1)
-        
+        x_norm = F.normalize(x, dim=-1)
+        x_hat = F.gelu(self.hidden(x_norm).squeeze(-1)).permute(0, 2, 1)
+        x_bound_hat = torch.tanh(self.hidden_bound(x_norm).squeeze(-1)).permute(0, 2, 1)
+
         doa_vec = self.doa(x_hat)
         doa_unit = F.normalize(doa_vec, dim=-1)
 
-        kappa = F.softplus(self.kappa(x_bound_hat).squeeze(-1)) + float(getattr(self.cfg, "bound_min", 1e-3))
+        kappa = F.softplus(self.kappa(x_bound_hat).squeeze(-1)) + float(
+            getattr(self.cfg, "bound_min", 1e-3)
+        )
         return doa_unit, kappa
-        
+
     def circ_error(self, angle):
         """Compute absolute wrapped angular error."""
         return ((angle + torch.pi) % (2 * torch.pi) - torch.pi).abs()
@@ -266,149 +294,116 @@ class DOAMAMBA(pl.LightningModule):
         valid = ~torch.isnan(gt)
         if torch.numel(std) > 1:
             std = std[valid]
-        return torch.mean((self.circ_error(est.unsqueeze(1)[valid] - gt[valid]) < std).float())
-    
-    @torch.no_grad()
-    def calibrate_scale(err, base_std, target=0.68):
-        # err, base_std: same shape, already masked (no NaNs)
-        """Search for a scalar that matches empirical coverage to the requested target."""
-        s = torch.logspace(-2, 2, 400, device=err.device)
-        cov = (err[:,None] < (s[None,:] * base_std[:,None])).float().mean(dim=0)
-        return s[(cov - target).abs().argmin()]
-    
-    def _sanitize(self, doa_vec, log_std):
-        """Replace invalid prediction values before downstream confidence computations."""
-        log_std = log_std.squeeze(-1)
-        doa_vec = torch.nan_to_num(doa_vec, nan=0.0)
-        log_std = torch.nan_to_num(log_std, nan=0.0, posinf=1.5, neginf=-4.0)
-        return doa_vec, log_std
+        return torch.mean((self.circ_error(est[valid] - gt[valid]) < std).float())
 
-    def _labels_to_vec(self, labels):
-        """Convert angle labels into 2D unit-vector targets and return the valid-frame mask."""
-        valid_mask = ~labels.isnan()
-        labels_vec = torch.stack((labels.cos(), labels.sin()), dim=-1)
-        return labels_vec, valid_mask
-
-    def _angle_metric(self, u, v):
-        """Compute angular distance between unit vectors via the chord-length identity."""
-        d = u - v
-        return 2.0 * torch.asin((d.norm(dim=-1).clamp(0.0, 2.0)) * 0.5)
-
-    def _best_speaker(self, pred_unit, labels_vec, valid_mask):
-        """Select the speaker track whose label trajectory best matches the current prediction."""
-        B, T, _ = labels_vec.shape
-        pred_exp = pred_unit.unsqueeze(1).expand(-1, S, -1, -1)
-        mean_ang = self._angle_metric(pred_exp, labels_vec).mean(-1)
-        mean_ang[torch.isnan(mean_ang)] = float('inf')
-        best_s = mean_ang.argmin(dim=1)
-        best_s_expand = best_s.view(B, 1, 1)
-        chosen_mask = valid_mask.gather(1, best_s_expand.expand(-1, 1, T)).squeeze(1)
-        chosen_tgt  = labels_vec.gather(1, best_s_expand.unsqueeze(-1).expand(-1, 1, T, 2)).squeeze(1)
-        return best_s, chosen_mask, chosen_tgt
-
-    def _alpha(self):
-        """Return the warmup-dependent calibration blending factor for the current epoch."""
-        if self.current_epoch < self.cfg.initial_warmup:
-            return 0.0
-        denom = max(1, self.cfg.warmup - self.cfg.initial_warmup)
-        return float(min(1.0, (self.current_epoch - self.cfg.initial_warmup) / denom))
-    
-    def _temporal_regularization(self, doa_vec):
-        """Measure frame-to-frame variation in the predicted DOA trajectory."""
-        return torch.linalg.norm(torch.diff(doa_vec, dim=-1))
-
-
-    def loss(self, doa_vec, kappa, labels, batch_idx, vad=None):
+    def loss(self, doa_vec, kappa, labels, vad=None):
         """Compute the training objective and summary metrics for a batch of DOA predictions.
 
-        Example:
-            Input: ``doa_vec`` with shape ``[B, T, 2]``, ``kappa`` with
-            shape ``[B, T]``, and ``labels`` with shape ``[B, T]``.
-            Output: ``(total_loss, mae, extra)`` where the first two entries are
-            scalars summarizing calibrated von Mises fit and mean angular error.
+        Input: ``doa_vec`` [B, T, 2], ``kappa`` [B, T], ``labels`` [B, T].
+        Output: ``(total_loss, mae)`` — calibrated von Mises NLL and mean angular error.
         """
         pred = F.normalize(doa_vec, dim=-1)
-        tgt = torch.stack((labels.cos(), labels.sin()), dim=-1)
 
-        if vad is None:
-            w = torch.isfinite(labels).float()
-        else:
-            w = vad.float() * torch.isfinite(labels).float()
+        w = torch.isfinite(labels).float()
+        if vad is not None:
+            w = w * vad.float()
 
-        cos = (pred * tgt).sum(dim=-1).clamp(-1.0, 1.0)
-        per = 1.0 - cos
-
+        cos = (
+            (pred * torch.stack((labels.cos(), labels.sin()), dim=-1))
+            .sum(dim=-1)
+            .clamp(-1.0, 1.0)
+        )
+        mae = torch.acos(cos.clamp(-0.999999, 0.999999)) * w
         denom = w.sum().clamp_min(1.0)
-        loss_main = (per * w).sum() / denom
-
-        mae = torch.acos(cos.clamp(-0.999999, 0.999999))
-        mae = (mae * w)
 
         lam = float(getattr(self.cfg, "temporal_reg_factor", 0.0))
         if lam > 0 and pred.shape[1] > 1:
-            w2 = (w[:, 1:] * w[:, :-1])
-            denom2 = w2.sum().clamp_min(1.0)
+            w2 = w[:, 1:] * w[:, :-1]
             tv = (pred[:, 1:] - pred[:, :-1]).norm(dim=-1)
-            loss_main = loss_main + lam * (tv * w2).sum() / denom2
+            temporal_loss = lam * (tv * w2).sum() / w2.sum().clamp_min(1.0)
+        else:
+            temporal_loss = 0.0
 
-        # total_loss = loss_main
-        # total_loss = pinball_loss(per, bound, w) + 0.1 * bound_loss_rank(per, bound, w)
-        error = ang_err_from_unit(pred, labels)
-        total_loss = vm_nll_calibrated(error, kappa, self.alpha)
-        # + (self.accuracy(torch.atan2(doa_vec[..., 1], doa_vec[..., 0]),
-        #                                                                 labels.unsqueeze(1),
-        #                                                                 kappa_to_circ_std(kappa).unsqueeze(1))
-        #                                                                   - 0.68).pow(2)
+        mode = str(getattr(self.cfg, "train_mode", "doa")).lower()
+        if mode == "doa":
+            total_loss = (mae[w > 0].sum() / denom) ** 2 + temporal_loss
+        else:
+            error = ang_err_from_unit(pred, labels)
+            total_loss = vm_nll_calibrated(error, kappa, self.alpha) + temporal_loss
 
-        return total_loss, mae.sum().detach() / denom, None
+        return total_loss, mae[w > 0].sum().detach() / denom
 
-    def training_step(self, batch,  batch_idx):
+    def training_step(self, batch, batch_idx):
         """Run one Lightning training step and log the main optimization metrics."""
         spectrum, labels, _ = batch
-
         doa, kappa = self(spectrum)
-        
-        train_loss, mae, _ = self.loss(doa, kappa, labels, batch_idx)
-
-        self.log("train_loss", train_loss.mean(), on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
-        self.log("train_mae", mae.mean(), on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
-        self.log("cal_alpha", self.alpha, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True, batch_size=self.cfg.batch_size)
-
+        train_loss, mae = self.loss(doa, kappa, labels)
+        self.log(
+            "train_loss",
+            train_loss.mean(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            prog_bar=True,
+            batch_size=self.cfg.batch_size,
+        )
+        self.log(
+            "train_mae",
+            mae.mean(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            prog_bar=True,
+            batch_size=self.cfg.batch_size,
+        )
+        self.log(
+            "cal_alpha",
+            self.alpha,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            prog_bar=True,
+            batch_size=self.cfg.batch_size,
+        )
         return train_loss.to(dtype=torch.float32)
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
         """Run one validation step, compute angular metrics, and log calibration behavior."""
-        spectrum, labels, title = batch
-        B = spectrum.size(0)
+        spectrum, labels, _ = batch
 
         doa_unit, kappa = self(spectrum)
         circ_std = kappa_to_circ_std(self.alpha.exp() * kappa)
-
-        doa     = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
+        doa = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
 
         if batch_idx == 0 and labels.size(0) > 1:
-            save_sample_as_image(doa[1].cpu(), labels[1].cpu(), circ_std[1].cpu(), title=f'{labels[1][0]}->{labels[1][-1]}', filename="DOA_1_example.png")
+            save_sample_as_image(
+                doa[1].cpu(),
+                labels[1].cpu(),
+                circ_std[1].cpu(),
+                title=f"{labels[1][0]}->{labels[1][-1]}",
+                filename="DOA_1_example.png",
+            )
 
-        val_loss, mae, _ = self.loss(doa_unit, kappa, labels, batch_idx)
+        val_loss, mae = self.loss(doa_unit, kappa, labels)
 
         ref = labels
-        ang10  = self.accuracy(doa, ref, torch.tensor(deg2rad(10.0)))
-        ang15  = self.accuracy(doa, ref, torch.tensor(deg2rad(15.0)))
-        angStd = self.accuracy(doa, ref, circ_std.unsqueeze(1))
-        angBound = self.accuracy(doa, ref, (1/kappa.rsqrt()).unsqueeze(1))
+        ang10 = self.accuracy(doa, ref, torch.tensor(deg2rad(10.0)))
+        ang15 = self.accuracy(doa, ref, torch.tensor(deg2rad(15.0)))
+        angStd = self.accuracy(doa, ref, circ_std)
+        angBound = self.accuracy(doa, ref, 1 / kappa.rsqrt())
 
         self.log_dict(
             {
-                "validation_loss":         val_loss.mean(),
-                "validation_mae":          torch.rad2deg(mae).mean(),
-                "validation_accuracy_10":  ang10.mean(),
-                "validation_accuracy_15":  ang15.mean(),
+                "validation_loss": val_loss.mean(),
+                "validation_mae": torch.rad2deg(mae).mean(),
+                "validation_accuracy_10": ang10.mean(),
+                "validation_accuracy_15": ang15.mean(),
                 "validation_accuracy_std": angStd.mean(),
                 "validation_accuracy_std_err": torch.abs(angStd.mean() - 0.68),
-                "validation_accuracy_bound":  angBound.mean(),
+                "validation_accuracy_bound": angBound.mean(),
                 # "mean_std_over_noise":     std_noise
-                "cal_alpha" : self.alpha
+                "cal_alpha": self.alpha,
             },
             on_epoch=True,
             sync_dist=True,
@@ -423,11 +418,25 @@ class DOAMAMBA(pl.LightningModule):
         opt = torch.optim.AdamW(
             (p for p in self.parameters() if p.requires_grad),
             lr=self.cfg.lr,
-            weight_decay=0.0
+            weight_decay=getattr(self.cfg, "weight_decay", 1e-5),
         )
-        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min")
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sch, "monitor": "train_loss"}}
-    
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min",
+            factor=getattr(self.cfg, "lr_factor", 0.5),
+            patience=getattr(self.cfg, "lr_patience", 10),
+            min_lr=getattr(self.cfg, "lr_min", 1e-6),
+        )
+        return {
+            "optimizer": opt,
+            "lr_scheduler": {
+                "scheduler": sch,
+                "monitor": "validation_loss",
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
+
     def on_load_checkpoint(self, ckpt):
         """Drop optimizer state from loaded checkpoints so resumed fine-tuning can start cleanly."""
         ckpt.pop("optimizer_states", None)
@@ -435,74 +444,99 @@ class DOAMAMBA(pl.LightningModule):
 
     def train_logstd_only(self):
         """Freeze most parameters and leave the confidence-related heads trainable."""
-        for p in self.parameters(): p.requires_grad = False
-        
-        for p in self.kappa.parameters(): p.requires_grad = True
-        for p in self.hidden_bound.parameters(): p.requires_grad = True
+        for p in self.parameters():
+            p.requires_grad = False
+
+        for p in self.kappa.parameters():
+            p.requires_grad = True
+        for p in self.hidden_bound.parameters():
+            p.requires_grad = True
         # self.alpha.requires_grad = True
-        
 
-@hydra.main(config_path="..", config_name="config", version_base="1.1")
-def main(cfg):
 
-    # our_transform = transforms.Normalize(mean=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2], std=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2])
-    """Build dataloaders, initialize the model, and launch PyTorch Lightning training.
-
-    Example:
-        >>> # From the repo root
-        >>> # python confidence_localization/train.py
-    """
-    train_loader = cld.get_dataloader(cfg, shuffle=True, stage="train")
-    val_loader = cld.get_dataloader(cfg, stage="val")
-
-    logger = TensorBoardLogger(cfg.log_dir, name="DOAMAMBA")
-
-    model = DOAMAMBA(cfg)
-
-    ckpt = cfg.resume_from_checkpoint if ("resume_from_checkpoint" in cfg.keys()) else None
-    if ckpt:
-        model = DOAMAMBA.load_from_checkpoint(ckpt, cfg=cfg, strict=False)
-        model.train_logstd_only()
-
-    checkpoint_loss_callback = ModelCheckpoint(
-    monitor="validation_loss",  # Monitor validation loss
-    dirpath=cfg.save_dir,  # Directory where the model is saved
-    filename="best-loss-checkpoint-{epoch:02d}-{validation_loss_epoch:.2f}",
-    save_top_k=2,  # Save only the best model
-    mode="min",  # "min" for loss, "max" for accuracy/metrics
-    save_last=True  # Save the last checkpoint
-    )
-
-    checkpoint_acc_callback_10 = ModelCheckpoint(
-        monitor="validation_accuracy_10",
-        dirpath=cfg.save_dir,
-        filename="best-acc10-{epoch:02d}-{validation_accuracy_10:.2f}",
-        save_top_k=2,
-        mode="max"
-    )
-
-    checkpoint_acc_callback_std = ModelCheckpoint(
-        monitor="validation_accuracy_std_err",
-        dirpath=cfg.save_dir,
-        filename="best-accstd-{epoch:02d}-{validation_accuracy_std:.2f}",
-        save_top_k=2,
-        mode="max"
-    )
-
-    trainer = pl.Trainer(
-        logger=logger,
+def _build_trainer(cfg, callbacks):
+    return pl.Trainer(
+        logger=TensorBoardLogger(cfg.log_dir, name="DOAMAMBA"),
         max_epochs=cfg.epochs,
         accelerator="cuda" if torch.cuda.is_available() else "cpu",
         devices=[cfg.default_gpu] if torch.cuda.is_available() else 0,
         precision="16-mixed" if torch.cuda.is_available() else 32,
         gradient_clip_val=0.5,
         gradient_clip_algorithm="norm",
-        callbacks=[checkpoint_loss_callback, checkpoint_acc_callback_10, checkpoint_acc_callback_std],
+        accumulate_grad_batches=getattr(cfg, "accumulate_grad_batches", 1),
+        callbacks=callbacks,
     )
-    
-    trainer.fit(model, train_loader, val_loader)
+
+
+def _load_weights(model, ckpt_path):
+    state = torch.load(ckpt_path, map_location="cpu")
+    model.load_state_dict(state.get("state_dict", state), strict=False)
+    print(f"Loaded weights from '{ckpt_path}'.")
+
+
+@hydra.main(config_path="..", config_name="config", version_base="1.1")
+def main(cfg):
+    """Launch training in one of two modes (set via ``train_mode`` in config.yaml):
+
+    doa        — train the full model end-to-end; optionally resume from a checkpoint.
+    confidence — load a trained DOA checkpoint, freeze the DOA head, and train the
+                 confidence (kappa) head only.
+    """
+    mode = str(getattr(cfg, "train_mode", "doa")).lower()
+    ckpt = getattr(cfg, "resume_from_checkpoint", None) or None
+
+    train_loader = cld.get_dataloader(cfg, shuffle=True, stage="train")
+    val_loader = cld.get_dataloader(cfg, stage="val")
+
+    model = DOAMAMBA(cfg)
+    if ckpt:
+        _load_weights(model, ckpt)
+
+    if mode == "confidence":
+        if not ckpt:
+            raise ValueError(
+                "train_mode=confidence requires resume_from_checkpoint to be set."
+            )
+        model.train_logstd_only()
+        print("Confidence mode: DOA head frozen, training bound head only.")
+    else:
+        print("DOA mode: training full model.")
+
+    callbacks = [
+        EarlyStopping(
+            monitor="validation_loss",
+            patience=getattr(cfg, "early_stopping_patience", 25),
+            min_delta=getattr(cfg, "early_stopping_min_delta", 1e-4),
+            mode="min",
+            verbose=True,
+        ),
+        ModelCheckpoint(
+            monitor="validation_loss",
+            dirpath=cfg.save_dir,
+            filename="best-loss-{epoch:02d}-{validation_loss:.4f}",
+            save_top_k=2,
+            mode="min",
+            save_last=True,
+        ),
+        ModelCheckpoint(
+            monitor="validation_accuracy_10",
+            dirpath=cfg.save_dir,
+            filename="best-acc10-epoch={epoch}-validation_accuracy_10={validation_accuracy_10:.2f}",
+            save_top_k=2,
+            mode="max",
+        ),
+        ModelCheckpoint(
+            monitor="validation_accuracy_std_err",
+            dirpath=cfg.save_dir,
+            filename="best-calibration-{epoch:02d}-{validation_accuracy_std:.2f}",
+            save_top_k=2,
+            mode="min",
+        ),
+    ]
+
+    _build_trainer(cfg, callbacks).fit(model, train_loader, val_loader)
+
 
 if __name__ == "__main__":
     torch.cuda.empty_cache()
     main()
-

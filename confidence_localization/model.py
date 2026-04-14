@@ -1,10 +1,8 @@
-from numpy import ceil
+import math
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import densenet121
-from einops import rearrange, repeat, einsum
-from scipy.special import i0, i0e
+from scipy.special import i0e
 
 ## Loss functions ##
 
@@ -13,6 +11,19 @@ TAU_68 = 0.6827
 def ang_wrap(x):
     """Wrap angular values into the principal interval ``[-pi, pi]``."""
     return (x + torch.pi) % (2 * torch.pi) - torch.pi
+
+
+def kappa_to_circ_std(kappa, eps=1e-12):
+    """Convert Von Mises concentration to circular standard deviation."""
+    # circular variance = 1 - I1(kappa)/I0(kappa), approximated via A(kappa) = I1/I0
+    # For numerical stability use the ratio of Bessel functions
+    A = 1.0 - 1.0 / (2.0 * kappa.clamp(min=eps))  # large-kappa approx of I1/I0
+    # More accurate: use torch.special.i1e / torch.special.i0e (both already scaled by exp(-|k|))
+    i0e = torch.special.i0e(kappa)
+    i1e = torch.special.i1e(kappa)
+    A = i1e / (i0e + eps)
+    circ_var = (1.0 - A).clamp(min=eps)
+    return torch.sqrt(-2.0 * torch.log(1.0 - circ_var + eps))
 
 def ang_err_from_unit(doa_unit, labels):
     """Compute the signed angular error between unit-vector predictions and angle labels."""
@@ -48,19 +59,6 @@ def hetero_gaussian_nll_err(err, log_var, weights=None, min_log_var=-10.0, max_l
     loss = 0.5 * (err.pow(2) * inv_var + lv)
     if weights is not None: loss = loss * weights
     return loss.mean()
-
-import math
-
-def kappa_to_circ_std(kappa, eps=1e-12):
-    """Convert von Mises concentration values into circular standard deviations.
-
-    Example:
-        Input: ``kappa = tensor([0.5, 10.0])``
-        Output: a tensor of positive standard deviations with shape ``[2]``,
-        where the value for ``10.0`` is smaller than the value for ``0.5``.
-    """
-    R = (torch.special.i1e(kappa) / torch.special.i0e(kappa)).clamp(eps, 1-eps)
-    return torch.sqrt(-2.0 * torch.log(R))
 
 def vm_nll_calibrated(err, kappa_raw, alpha, mask=None, lam=0.1, p=0.68, tau=0.05, kappa_max=200., eps=1e-12):
     """Compute a calibrated von Mises negative log-likelihood with a soft coverage penalty.
@@ -111,18 +109,6 @@ def von_mises_loss(mean_err_squared, log_std, log_var_weight=1):
     log_I0 = torch.log(torch.i0(kappa) + 1e-8)
     nll = -(kappa * torch.cos(angle_error) - log_I0) + log_var_weight * log_kappa # von Mises NLL: -log(I0(kappa)) - kappa * cos(error)
     return nll.mean()
-
-def kappa_to_circ_std(kappa, eps=1e-12):
-    """Convert von Mises concentration values into circular standard deviations.
-
-    Example:
-        Input: ``kappa = tensor([0.5, 10.0])``
-        Output: a tensor of positive standard deviations with shape ``[2]``,
-        where the value for ``10.0`` is smaller than the value for ``0.5``.
-    """
-    kappa = torch.clamp(kappa, min=eps)
-    R = (torch.special.i1e(kappa) / torch.special.i0e(kappa)).clamp(eps, 1-eps)
-    return torch.sqrt(-2.0 * torch.log(R))
 
 def halfnormal_loss(error, bound, weights, sigma_min=1e-3, sigma_max=1e9):
     """Compute a half-normal NLL for an absolute angular error and predicted scale.

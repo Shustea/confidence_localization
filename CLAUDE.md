@@ -13,14 +13,20 @@ Sound source localization (Direction of Arrival / DOA estimation) in the time-fr
 make requirements
 # or: pip install -r requirements.txt
 
-# Train the model
-python confidence_localization/train.py
+# Train DOA model (full model, MAE loss)
+python confidence_localization/train.py train_mode=doa
+
+# Train confidence head only (freeze DOA, von Mises NLL)
+python confidence_localization/train.py train_mode=confidence resume_from_checkpoint=<doa_ckpt>
 
 # Evaluate / test the model
 python confidence_localization/test.py
 
+# Preprocess RealMAN data to cached .pt files
+python data/make_dataset.py make_dataset.mode=realman
+
 # Preprocess / generate synthetic dataset
-python data/make_dataset.py +dataset.mode=generate_synthetic
+python data/make_dataset.py make_dataset.mode=synthetic
 
 # Lint
 make lint        # flake8 + isort + black (check only)
@@ -37,10 +43,12 @@ Raw audio → `util.compute_multichannel_stft()` → `util.estimate_rtf()` (nois
 
 Three dataset sources share the same RTF feature format:
 - **Synthetic** (`CLDataset`): pre-computed tensors under `data/processed/`
-- **RealMAN** (`RealMANDataset`): real recordings from `data/raw/`
+- **RealMAN** (`RealMANDataset` / `CachedExternalDataset`): real recordings from `data/raw/RealMAN`, cached as `.pt` under `data/lab/processed/.../RealMAN/{train,val}`
 - **LOCATA** (`LOCATADataset`): real recordings from `data/raw/locata`
 
-Preprocessing (caching RTFs) is done by `data/make_dataset.py`. The `data/eval_utils.py` handles label interpolation, caching, and evaluation summaries for real datasets.
+Preprocessing (caching RTFs) is done by `data/make_dataset.py make_dataset.mode=realman`. The `data/eval_utils.py` handles label interpolation, caching, and evaluation summaries for real datasets.
+
+`CachedExternalDataset` supports `target_duration_sec` (set in config per split) which pads/truncates all samples to a fixed frame count. Samples shorter than 2 seconds should be filtered from the cache before training (see data filtering notes below).
 
 ### Model (`confidence_localization/train.py`)
 
@@ -53,12 +61,11 @@ Key hyperparameters in `config.yaml`: `d_model`, `hidden_dim`, `layers` (list of
 
 ### Loss Functions (`confidence_localization/model.py`)
 
-Multiple loss options exist; the active one is controlled by `bound_loss_func` in `config.yaml` (currently `"von_mises"`):
-- `vm_nll_calibrated()` — Von Mises NLL with a soft coverage penalty to calibrate κ
-- `von_mises_loss()` — plain Von Mises NLL
-- `gaussian_loss()`, `hetero_gaussian_nll_err()`, `bound_loss()`, etc. — alternatives
+Two-stage training with different losses per stage:
+- **DOA mode** (`train_mode: doa`): Mean Angular Error (MAE) + temporal smoothness regularizer. No confidence loss — kappa head runs but doesn't affect the loss.
+- **Confidence mode** (`train_mode: confidence`): `vm_nll_calibrated()` — Von Mises NLL with a soft coverage penalty to calibrate κ. DOA head is frozen.
 
-Total loss = DOA loss + `log_var_weight` × confidence loss + `temporal_reg_factor` × temporal smoothness regularizer.
+Other loss functions available but not currently active: `von_mises_loss()`, `gaussian_loss()`, `hetero_gaussian_nll_err()`, `bound_loss()`, etc.
 
 ### Training Details
 
@@ -66,7 +73,11 @@ Total loss = DOA loss + `log_var_weight` × confidence loss + `temporal_reg_fact
 - AdamW optimizer with `ReduceLROnPlateau` scheduler
 - Three ModelCheckpoint callbacks: best val loss, best accuracy, best calibration
 - Resume from checkpoint: set `resume_from_checkpoint` in `config.yaml`
-- To fine-tune only the confidence head, call `train_logstd_only()` which freezes DOA weights
+- Two-stage workflow:
+  1. Train DOA: `train_mode: doa` — trains full model end-to-end with MAE loss
+  2. Train confidence: `train_mode: confidence` — loads DOA checkpoint, freezes DOA head via `train_logstd_only()`, trains only kappa/bound heads with von Mises NLL
+- Data source controlled by `data.train.source` / `data.val.source` (synthetic, realman, or locata)
+- RealMAN cached data uses `feature_mode: cached` with `target_duration_sec: 3` (pad/truncate to 188 frames)
 
 ### Evaluation (`confidence_localization/test.py`)
 
@@ -88,14 +99,16 @@ hidden_dim: 64
 layers: [2, 4, 4, 4]
 
 # Training
-batch_size: 16
+batch_size: 8
 lr: 1e-4
-epochs: 100
-log_var_weight: 1        # confidence loss weight
+epochs: 200
+train_mode: doa          # "doa" = MAE loss; "confidence" = freeze DOA, von Mises NLL
 temporal_reg_factor: 1e-4
 
-# Loss
-bound_loss_func: "von_mises"
+# Data source
+data.train.source: realman    # synthetic | realman | locata
+data.val.source: realman
+target_duration_sec: 3        # pad/truncate cached samples to 3 seconds (188 frames)
 
 # Paths (outputs)
 logs: logs/
