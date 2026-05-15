@@ -248,9 +248,14 @@ class DOAMAMBA(pl.LightningModule):
         doa     = torch.atan2(doa_unit[..., 1], doa_unit[..., 0])
 
         if batch_idx == 0 and labels.size(0) > 1:
-            save_sample_as_image(doa[1].cpu(), labels[1].cpu(), 0.01*torch.ones(doa[1].shape).cpu(), title=f'{labels[1][0]}->{labels[1][-1]}', filename="DOA_1_example.png")
-            # if ~torch.isnan(labels[1, 1].cpu()).any():
-            #     save_sample_as_image(doa[1].cpu(), labels[1, 1].cpu(), 0.01*torch.ones(doa[1].shape).cpu(), title=f'{labels[1, 1][0]}->{labels[1, 1][-1]}', filename="DOA_2_example.png")
+            bound = log_std[1].squeeze(-1).exp()
+            save_sample_as_image(
+                doa[1].cpu(),
+                labels[1].cpu(),
+                bound.cpu(),
+                filename="DOA_1_example.png",
+                spectrum=spectrum[1].cpu(),
+            )
 
         val_loss, mae, best_spk = self.loss(doa_unit, log_std, labels, batch_idx)
 

@@ -1,15 +1,15 @@
-train_path: "/workspaces/confidence_localization/data/processed/train/"
-val_path: "/workspaces/confidence_localization/data/processed/validation/"
-test_path: "/workspaces/confidence_localization/data/processed/test/"
-rir_bank_path: "/workspaces/confidence_localization/data/interim/rir_bank/"
-target_path: "/workspaces/confidence_localization/data/processed/target/"
-wav_path: "/workspaces/confidence_localization/data/raw/WSJ0_raw/"
+train_path: "/workspaces/confidence_localization/data/lab/data/processed/1spk_6pink_snr20dB_5ch/train/"
+val_path: "/workspaces/confidence_localization/data/lab/data/processed/1spk_6pink_snr20dB_5ch/validation/"
+test_path: "/workspaces/confidence_localization/data/lab/data/processed/1spk_6pink_snr20dB_5ch/test/"
+rir_bank_path: "/workspaces/confidence_localization/data/lab/data/interim/rir_bank/"
+target_path: "/workspaces/confidence_localization/data/lab/data/processed/1spk_6pink_snr20dB_5ch/target/"
+wav_path: "/workspaces/confidence_localization/data/lab/data/raw/WSJ0_raw/"
 log_dir: "/workspaces/confidence_localization/logs/DOAMAMBA"
 save_dir: "/workspaces/confidence_localization/models/"
 
-default_gpu : 7
+default_gpu : 6
 
-resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2026-01-18/21-35-46/models/best-acc10-epoch=116-validation_accuracy_10=0.91.ckpt"
+resume_from_checkpoint: false
 
 train_size : 5400
 val_size : 600

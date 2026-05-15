@@ -1,61 +1,141 @@
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
 from scipy.linalg import eig
 import torch.nn.functional as F
 from torch.jit import script
 
-def save_sample_as_image(tensor: torch.Tensor, label: torch.Tensor, bound: torch.Tensor, filename: str, title=None, path='/workspaces/confidence_localization/samples/'):
-    # Ensure tensor is on CPU and detach if it's a computation graph tensor
-    tensor = tensor.squeeze()
-    
-    tensor = tensor.cpu()
-    bound = bound.cpu()
+def save_sample_as_image(
+    tensor: torch.Tensor,
+    label: torch.Tensor,
+    bound: torch.Tensor,
+    filename: str,
+    spectrum: torch.Tensor = None,
+    title: str = None,
+    path: str = '/workspaces/confidence_localization/samples/',
+):
+    """Save a publication-quality DOA evaluation figure.
 
-    tensor = tensor.detach()
-    bound = bound.detach()
+    Top panel: azimuth estimate with ±1σ confidence band vs. ground truth.
+    Second panel: absolute angular error and predicted confidence bound.
+    Third panel (optional): a 1D REIR slice at the middle time frame, with one
+    line per channel, when ``spectrum`` is provided with shape
+    ``[C, T, Freq/Lag]``.
+    """
+    tensor = tensor.squeeze().detach().cpu().float()
+    label = label.squeeze().detach().cpu().float()
+    bound = bound.squeeze().detach().cpu().float()
 
-    plt.figure()
-    plt.plot(label, torch.rad2deg(torch.abs(tensor - label)), label='error', color='red')
-    plt.xlabel('Actual DOA [radians]')
-    plt.ylabel('Error At Direction [deg]')
-    plt.suptitle('Angle error at target DOA')
-    plt.title(title)
-    plt.legend()
-    plt.grid()
+    doa_deg = torch.rad2deg(tensor).numpy()
+    bound_deg = torch.rad2deg(bound).numpy()
 
-    # Save the image
-    plt.savefig(path + 'error_plot_of_' + filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
-    plt.close()
+    valid = torch.isfinite(label)
+    valid_np = valid.numpy()
+    label_deg = np.where(valid_np, np.rad2deg(label.numpy()), np.nan)
 
-    time_axis = np.arange(label.shape[-1])
+    finite_idx = np.flatnonzero(valid_np)
+    if finite_idx.size > 0:
+        start_doa = float(label[int(finite_idx[0])])
+        end_doa = float(label[int(finite_idx[-1])])
+        panel_title = f"starting DOA {start_doa:.4f} rad → ending DOA {end_doa:.4f} rad"
+    else:
+        panel_title = "starting DOA (n/a) → ending DOA (n/a)"
 
-    plt.figure()
-    plt.plot(time_axis, tensor, label='Estimation', color='blue')
-    plt.plot(time_axis, tensor + bound, label='Estimation Bound', color='cyan')
-    plt.plot(time_axis, tensor - bound, label='Estimation Bound', color='cyan')
-    plt.plot(time_axis, label, label='GT', color='red')
-    plt.suptitle('Estimation angle (with bounds) compared to Ground Truth')
-    plt.title(title)
-    plt.xlabel('Time [frames]')
-    plt.ylabel('Azimuth [radians]')
-    plt.legend()
+    diff = torch.remainder(tensor - label + torch.pi, 2 * torch.pi) - torch.pi
+    error_deg = np.where(valid_np, torch.rad2deg(diff.abs()).numpy(), np.nan)
 
-    # Save the image
-    plt.savefig(path + 'azimuth_plot_of_'+ filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
-    plt.close()
+    t = np.arange(doa_deg.shape[0])
+    _BLUE = '#2166ac'
+    _RED = '#d6604d'
 
-    plt.figure()
-    plt.plot(time_axis, torch.rad2deg(bound), label='Estimation Bounds', color='black')
-    plt.suptitle('Estimation bounds compared to time')
-    plt.title(title)
-    plt.xlabel('Time [frames]')
-    plt.ylabel('error bound [degrees]')
-    plt.legend()
+    rc = {
+        'font.family': 'serif',
+        'font.size': 10,
+        'axes.titlesize': 11,
+        'axes.labelsize': 10,
+        'legend.fontsize': 9,
+        'xtick.labelsize': 9,
+        'ytick.labelsize': 9,
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'axes.grid': True,
+        'grid.color': '#cccccc',
+        'grid.linestyle': '--',
+        'grid.linewidth': 0.6,
+        'lines.linewidth': 1.5,
+        'figure.facecolor': 'white',
+        'axes.facecolor': 'white',
+        'savefig.facecolor': 'white',
+    }
 
-    # Save the image
-    plt.savefig(path + 'bound_plot_of_'+ filename, bbox_inches='tight', pad_inches=0.1, dpi=300)
-    plt.close()
+    reir = None
+    if spectrum is not None:
+        reir = spectrum.detach().cpu().float().numpy()
+        if reir.ndim != 3:
+            reir = None
+
+    has_reir = reir is not None
+    n_rows = 3 if has_reir else 2
+    height_ratios = [3, 2, 2] if has_reir else [3, 2]
+    fig_h = 7.5 if has_reir else 5.5
+
+    with plt.rc_context(rc):
+        fig, axes = plt.subplots(
+            n_rows, 1, figsize=(8, fig_h),
+            gridspec_kw={'height_ratios': height_ratios},
+        )
+        if n_rows == 1:
+            axes = [axes]
+        fig.subplots_adjust(hspace=0.3)
+        fig.suptitle(filename, fontsize=12, y=0.995)
+
+        ax1, ax2 = axes[0], axes[1]
+        ax1.sharex(ax2)
+
+        ax1.fill_between(t, doa_deg - bound_deg, doa_deg + bound_deg,
+                         color=_BLUE, alpha=0.18, label='±1σ confidence', zorder=2)
+        ax1.plot(t, doa_deg, color=_BLUE, lw=1.5, label='Estimate', zorder=3)
+        ax1.plot(t, label_deg, color=_RED, lw=1.5, ls='--', label='Ground truth', zorder=4)
+        ax1.set_ylabel('Azimuth (°)')
+        all_vals = np.concatenate([doa_deg, label_deg[~np.isnan(label_deg)]])
+        if all_vals.size > 0:
+            lo, hi = float(np.min(all_vals)), float(np.max(all_vals))
+            pad = max(5.0, 0.1 * (hi - lo))
+            ax1.set_ylim(lo - pad, hi + pad)
+        ax1.legend(loc='upper right', framealpha=0.9, edgecolor='#aaaaaa')
+        ax1.set_title(panel_title, pad=5)
+
+        ax2.fill_between(t, 0, bound_deg, color=_BLUE, alpha=0.18, zorder=2)
+        ax2.plot(t, bound_deg, color=_BLUE, lw=1.2, ls='--', label='σ bound', zorder=3)
+        ax2.plot(t, error_deg, color=_RED, lw=1.2, label='|Error|', zorder=4)
+        ax2.set_ylabel('Error (°)')
+        ax2.set_xlabel('Time (frames)')
+        ax2.set_ylim(bottom=0)
+        ax2.legend(loc='upper right', framealpha=0.9, edgecolor='#aaaaaa')
+
+        if has_reir:
+            ax3 = axes[2]
+            C, T_reir, L = reir.shape
+            t_mid = T_reir // 2
+            lag_axis = np.arange(L) - L // 2
+            cmap = plt.get_cmap('viridis')
+            for c in range(C):
+                ax3.plot(
+                    lag_axis, reir[c, t_mid, :],
+                    color=cmap(c / max(1, C - 1)),
+                    lw=1.2, label=f'ch {c + 1}',
+                )
+            ax3.axvline(0, color='#888888', lw=0.6, ls=':')
+            ax3.set_xlabel('Lag (samples)')
+            ax3.set_ylabel('REIR')
+            ax3.set_title(f'REIR slice @ t = {t_mid}', pad=5)
+            ax3.legend(loc='upper right', framealpha=0.9, edgecolor='#aaaaaa', ncol=C)
+
+        out = Path(path) / filename
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=300, bbox_inches='tight')
+        plt.close(fig)
 
 def gevd(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Tensor:
 
