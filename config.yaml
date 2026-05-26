@@ -9,7 +9,7 @@ save_dir: "/workspaces/confidence_localization/models/"
 
 default_gpu : 6
 
-resume_from_checkpoint: false
+resume_from_checkpoint: "/workspaces/confidence_localization/outputs/2026-05-14/18-10-45/models/best-acc10-epoch=197-validation_accuracy_10=0.97.ckpt"
 
 train_size : 5400
 val_size : 600
@@ -39,6 +39,7 @@ receivers_coords:
 J : 1 #amount of pink noise sources
 
 src_height : 1.75
+source_radius: 1.825  # m, midpoint of data_helpers.generate_speaker_sample U(1.5, 2.15); used only by the room-geometry validation plot
 
 sound_velocity: 340
 hop : 32
@@ -93,3 +94,103 @@ initial_warmup : 0
 warmup : 300
 
 noise_beta : 0
+
+# Optional roots for external datasets (only used if data.<stage>.source is set to one of them).
+realman_root: "/workspaces/confidence_localization/data/lab/data/raw/RealMAN"
+locata_root: "/workspaces/confidence_localization/data/lab/data/raw/locata"
+realman_target: "/workspaces/confidence_localization/data/lab/data/processed/RealMAN"
+locata_target: "/workspaces/confidence_localization/data/lab/data/processed/LOCATA"
+
+# Energy-based VAD config (used by the realtime RealMAN/LOCATA dataloader paths).
+# Omit / comment this whole block to disable VAD (datasets fall back to all-ones).
+vad:
+  alpha: 4          # speech threshold = alpha * adaptive noise floor
+  hangover_ms: 150  # propagate speech-flag forward for this many ms
+  hop_ms: 10
+  frame_ms: 20
+  win_sec: 1        # noise-floor adaptation window
+
+# Loader defaults shared by every stage when no per-stage override is set.
+# Stage-level overrides go in data.<stage>.loader; the dataloader walks:
+#     data.<stage>.loader.<key>  →  <key> at config root  →  built-in default
+loader_defaults:
+  batch_size: ${batch_size}
+  num_workers: ${num_workers}
+  pin_memory: true
+
+# Per-source loader defaults — paste these under data.<stage>.loader when you
+# switch sources. The dataloader doesn't auto-pick them (it only reads
+# data.<stage>.loader); they live here as the documented values to copy in.
+loader_per_source:
+  synthetic:
+    batch_size: ${batch_size}          # 8 by default
+    num_workers: ${num_workers}
+    pin_memory: true
+  realman:
+    batch_size: 4                       # realtime: variable-length wav, can't stack
+    num_workers: 0                      # soundfile + python loaders, low parallelism
+    pin_memory: true
+  locata:
+    batch_size: 1                       # single recording per dataset
+    num_workers: 0
+    pin_memory: true
+
+# Per-stage dataset dispatch. ``source`` selects the dataset; the matching sub-block
+# below it gives the dataset-specific settings (including its own target sample
+# length). To override loader settings, edit ``data.<stage>.loader`` directly or
+# pass ``data.train.loader.batch_size=1`` on the CLI when switching to realman.
+data:
+  train:
+    source: realman                     # synthetic | realman | locata — only knob to flip
+    loader: ${loader_per_source.${data.train.source}}   # auto-tracks source
+    synthetic:
+      root: ${train_path}
+    realman:
+      root: ${realman_root}
+      split: train
+      mode: moving
+      use_noisy: true
+      channels: [0, 3, 5, 7, 1]
+      every_nth: 1
+      max_items: null
+      feature_mode: cached              # realtime | cached
+      cache_root: "${realman_target}/train"
+      target_duration_sec: 8            # RealMAN default sample length (seconds)
+    locata:
+      root: ${locata_root}
+      split: dev
+      task: 1
+      recording: 1
+      array: eigenmike
+      channels: [4, 10, 6, 1, 19]
+      source_name: null
+      feature_mode: realtime
+      cache_root: "${locata_target}/train"
+      target_duration_sec: 8            # LOCATA default sample length (seconds)
+  val:
+    source: realman
+    loader: ${loader_per_source.${data.val.source}}
+    synthetic:
+      root: ${val_path}
+    realman:
+      root: ${realman_root}
+      split: val
+      mode: moving
+      use_noisy: true
+      channels: [0, 3, 5, 7, 1]
+      every_nth: 1
+      max_items: null
+      feature_mode: cached
+      cache_root: "${realman_target}/val"
+      target_duration_sec: 8
+    locata:
+      root: ${locata_root}
+      split: dev
+      task: 1
+      recording: 1
+      array: eigenmike
+      channels: [4, 10, 6, 1, 19]
+      source_name: null
+      feature_mode: realtime
+      cache_root: "${locata_target}/val"
+      target_duration_sec: 8

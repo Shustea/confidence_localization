@@ -137,6 +137,132 @@ def save_sample_as_image(
         fig.savefig(out, dpi=300, bbox_inches='tight')
         plt.close(fig)
 
+def save_room_geometry(
+    labels,
+    room_dim,
+    mic_positions,
+    source_radius: float,
+    src_height: float,
+    filename: str = "room_geometry_example.png",
+    title: str = "Room Geometry",
+    path: str = "/workspaces/confidence_localization/samples/",
+) -> None:
+    """Save a 3D room-geometry plot mirroring data/signal_generator/run_example.py.
+
+    The source XY is reconstructed from ``labels`` (per-frame azimuth in rad) on
+    a fixed circle at ``source_radius`` around the microphone-array centroid and
+    placed at ``src_height``. NaN frames are dropped; if fewer than 2 valid
+    frames remain, the trajectory is suppressed but the room + mics still render.
+    """
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers projection='3d')
+
+    labels_np = labels.detach().cpu().float().numpy() if torch.is_tensor(labels) else np.asarray(labels, dtype=np.float32)
+    labels_np = labels_np.reshape(-1)
+    n_total = int(labels_np.shape[0])
+    valid_mask = np.isfinite(labels_np)
+    n_valid = int(valid_mask.sum())
+
+    room_dim_arr = np.asarray(room_dim, dtype=np.float64).reshape(-1)
+    if room_dim_arr.size != 3:
+        raise ValueError(f"room_dim must have 3 entries, got {tuple(room_dim_arr.shape)}")
+    mic_arr = np.asarray(mic_positions, dtype=np.float64)
+    if mic_arr.ndim != 2 or mic_arr.shape[1] != 3:
+        raise ValueError(f"mic_positions must be [M, 3], got {tuple(mic_arr.shape)}")
+    array_center = mic_arr.mean(axis=0)
+
+    if n_valid >= 2:
+        first_idx = int(np.argmax(valid_mask))
+        last_idx = int(n_total - 1 - np.argmax(valid_mask[::-1]))
+        start_az = float(labels_np[first_idx])
+        end_az = float(labels_np[last_idx])
+        # Interpolate azimuth across the recording (unwrapped) so the trajectory
+        # is a smooth arc between start and end, matching the reference plot.
+        az_unwrapped = np.unwrap(labels_np[first_idx:last_idx + 1])
+        az_full = np.full(n_total, np.nan, dtype=np.float64)
+        az_full[first_idx:last_idx + 1] = az_unwrapped
+        valid_indices = np.where(np.isfinite(az_full))[0]
+        sp_path = np.empty((valid_indices.size, 3), dtype=np.float64)
+        sp_path[:, 0] = array_center[0] + source_radius * np.cos(az_full[valid_indices])
+        sp_path[:, 1] = array_center[1] + source_radius * np.sin(az_full[valid_indices])
+        sp_path[:, 2] = src_height
+        suffix = f"({n_valid}/{n_total} frames valid)"
+    else:
+        sp_path = None
+        start_az = end_az = None
+        suffix = f"({n_valid}/{n_total} frames valid — trajectory unavailable)"
+
+    # MATLAB-default palette to match run_example.py.
+    palette = ["#0072BD", "#D95319", "#EDB120", "#7E2F8E"]
+
+    rc = {
+        "font.family": "serif", "font.size": 10,
+        "axes.titlesize": 12, "axes.labelsize": 10,
+        "legend.fontsize": 9, "xtick.labelsize": 9, "ytick.labelsize": 9,
+        "figure.facecolor": "white", "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+    }
+
+    with plt.rc_context(rc):
+        fig = plt.figure(figsize=(7.5, 5.5))
+        ax = fig.add_subplot(111, projection="3d")
+
+        # Wireframe box: 12 edges of [0, room_dim] cube.
+        x0, y0, z0 = 0.0, 0.0, 0.0
+        x1, y1, z1 = float(room_dim_arr[0]), float(room_dim_arr[1]), float(room_dim_arr[2])
+        corners = np.array([
+            [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+            [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+        ])
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        for a, b in edges:
+            ax.plot(
+                [corners[a, 0], corners[b, 0]],
+                [corners[a, 1], corners[b, 1]],
+                [corners[a, 2], corners[b, 2]],
+                lw=0.6, color="#aaaaaa", alpha=0.4,
+            )
+
+        if sp_path is not None:
+            step = max(1, sp_path.shape[0] // 600)
+            ax.plot(
+                sp_path[::step, 0], sp_path[::step, 1], sp_path[::step, 2],
+                ".", color=palette[0], ms=3.0, alpha=0.55,
+                label="Source trajectory", zorder=2,
+            )
+            ax.scatter(
+                *sp_path[0], color=palette[1], s=80, zorder=5,
+                edgecolors="k", linewidths=0.5,
+                label=f"Start ({np.rad2deg(start_az):.0f}°)",
+            )
+            ax.scatter(
+                *sp_path[-1], color=palette[2], s=100, marker="*", zorder=5,
+                edgecolors="k", linewidths=0.3,
+                label=f"End ({np.rad2deg(end_az):.0f}°)",
+            )
+        ax.scatter(
+            mic_arr[:, 0], mic_arr[:, 1], mic_arr[:, 2],
+            color=palette[3], s=100, marker="^", zorder=5,
+            edgecolors="k", linewidths=0.5, label="Microphones",
+        )
+
+        ax.set_xlim(0, x1); ax.set_xlabel("x (m)")
+        ax.set_ylim(0, y1); ax.set_ylabel("y (m)")
+        ax.set_zlim(0, z1); ax.set_zlabel("z (m)")
+        ax.set_title(f"{title}  {suffix}")
+        ax.view_init(elev=25, azim=-50)
+        ax.legend(loc="upper left", fontsize=10, framealpha=0.85)
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        out = Path(path) / filename
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+
 def gevd(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Tensor:
 
     # torch doesn't have gevd solver so well whiten the cov matrices
@@ -174,27 +300,51 @@ def cholesky(Rs: torch.Tensor, Rv: torch.Tensor, eps : float = 1e-9) -> torch.Te
     return v
 
 
-def energy_vad(x, fs, frame_ms=20, hop_ms=10, alpha=4, win_sec=1):
-    frame = int(frame_ms*fs/1000)
-    hop   = int(hop_ms*fs/1000)
-    W     = int(win_sec*1000/hop_ms)
-    # 1. short-time power
+def energy_vad(x, fs, frame_ms=20, hop_ms=10, alpha=4, win_sec=1, hangover_ms=150):
+    """Energy-based VAD with adaptive noise floor + hangover smoothing.
+
+    Input: 1D waveform tensor ``x`` at sample rate ``fs``.
+    Output: 1D bool tensor of length ``(len(x) - frame) // hop + 1`` with ``True`` for speech frames.
+    """
+    if x.ndim > 1:
+        x = x.reshape(-1)
+    frame = int(frame_ms * fs / 1000)
+    hop = int(hop_ms * fs / 1000)
+    W = int(win_sec * 1000 / hop_ms)
     frames = x.unfold(0, frame, hop)
-    E      = (frames**2).mean(-1)
-    # 2-3. adaptive noise floor + threshold
-    pad_E  = torch.cat([E[:1].repeat(W), E])
-    noise  = torch.minimum.accumulate(pad_E)[:-W]        # causal min-tracker
-    vad    = E > alpha*noise
-    # 4-5. 150 ms hang-over
-    hang   = int(0.15*1000/hop_ms)
-    for i in range(1, hang): vad[:-i] |= vad[i:]
+    E = (frames ** 2).mean(-1)
+    pad_E = torch.cat([E[:1].repeat(W), E])
+    noise = torch.cummin(pad_E, dim=0).values[:-W]
+    vad = E > alpha * noise
+    hang = max(1, int(hangover_ms / hop_ms))
+    for i in range(1, hang):
+        tail = vad[i:].clone()
+        vad[:-i] = vad[:-i] | tail
     return vad
+
+
+def vad_to_rtf_frames(vad, vad_hop_ms, rtf_hop_samples, fs, n_rtf_frames):
+    """Nearest-neighbor resample a VAD bool tensor onto the RTF frame grid.
+
+    ``vad``: bool tensor at ``vad_hop_ms`` hop.
+    Returns a bool tensor of length ``n_rtf_frames`` aligned to the RTF frames.
+    """
+    rtf_hop_ms = 1000.0 * rtf_hop_samples / fs
+    src_idx = (np.arange(n_rtf_frames) * rtf_hop_ms / vad_hop_ms).astype(np.int64)
+    src_idx = np.clip(src_idx, 0, vad.shape[0] - 1)
+    vad_np = vad.cpu().numpy() if torch.is_tensor(vad) else np.asarray(vad)
+    return torch.from_numpy(vad_np[src_idx].astype(bool))
 
 
 def estimate_cov_batched(X):
     return (X @ X.conj().transpose(-2, -1)) / X.shape[-1]
 
 def estimate_rtf(cfg, spectrums, epsilon=0.01):
+    """Estimate RTF features from multichannel STFT data (batched eig per-frame).
+
+    Input: ``spectrums`` with shape ``[M, F, T]``.
+    Output: an RTF feature tensor with shape ``[M - 1, Ts, 2 * (K - 1)]``.
+    """
     M, F, T = spectrums.shape
     device, cdtype = spectrums.device, spectrums.dtype
 
@@ -207,52 +357,58 @@ def estimate_rtf(cfg, spectrums, epsilon=0.01):
     z_s = spectrums[:, :K, Tn:]
     Ts = z_s.shape[-1]
 
-    Rv = torch.zeros((K, M, M), dtype=cdtype, device=device)
-    L  = torch.zeros((K, M, M), dtype=cdtype, device=device)
-
     I = torch.eye(M, device=device, dtype=cdtype)
 
-    Xn = z_n.permute(1, 0, 2)
-    Rv = (Xn @ Xn.conj().transpose(-1, -2)) / Xn.shape[-1]
-    Rv = Rv + (epsilon * torch.linalg.norm(Rv, ord="fro", dim=(-2, -1)).view(K, 1, 1)) * I
-    L = torch.linalg.cholesky((Rv + Rv.conj().permute(0,-1,-2))/2)
+    if Tn > 0:
+        Xn = z_n.permute(1, 0, 2)
+        Rv = (Xn @ Xn.conj().transpose(-1, -2)) / Xn.shape[-1]
+    else:
+        Rv = epsilon * I.unsqueeze(0).expand(K, -1, -1).clone()
 
-    alpha = cfg.exp_window_smoothing
+    # Symmetrize and Cholesky-factorize. Use UNREGULARIZED L for the back-transform
+    # and a SEPARATE regularized L_reg for the whitening (matches MATLAB convention).
+    Rv_sym = (Rv + Rv.conj().permute(0, -1, -2)) / 2
+    Rv_diag = torch.diagonal(Rv_sym, dim1=-2, dim2=-1).real.mean(dim=-1).clamp(min=1e-10)
+    Rv_sym = Rv_sym + (epsilon * Rv_diag).view(K, 1, 1) * I
+    L = torch.linalg.cholesky(Rv_sym)
+
+    L_norms = torch.linalg.norm(L, dim=(-2, -1)).view(K, 1, 1)
+    L_reg = L + epsilon * L_norms * I
+
     win_len = cfg.win_len
-
-    Rs_prev = torch.zeros((K, M, M), dtype=cdtype, device=device)
+    zs_kmt = z_s.permute(1, 0, 2)
     G_tf = torch.zeros((K, Ts, M), dtype=cdtype, device=device)
 
-    for k in range(K):
-        Lk = L[k]
-        for t in range(Ts):
-            a = max(0, t - win_len)
-            b = min(Ts - 1, t + win_len)
-            x = z_s[:, k, a:b+1]
-            Xw = torch.linalg.solve_triangular(Lk, x, upper=False)
-            Rs = (Xw @ Xw.conj().T) / Xw.shape[1]
-            if t > 0:
-                Rs = alpha * Rs_prev[k] + (1 - alpha) * Rs
-            Rs_prev[k] = Rs
-            w, V = torch.linalg.eig(Rs)
-            i = w.abs().argmax()
-            psi = V[:, i]
-            u = Lk @ psi
-            g = u / u[0]
-            G_tf[k, t] = g
+    for t in range(Ts):
+        a = max(0, t - win_len)
+        b = min(Ts - 1, t + win_len)
+        ws = b - a + 1
+        x_batch = zs_kmt[:, :, a:b+1]
+        Xw = torch.linalg.solve_triangular(L_reg, x_batch, upper=False)
+        Rs = (Xw @ Xw.conj().transpose(-1, -2)) / ws
+        _, V = torch.linalg.eigh(Rs)
+        psi = V[:, :, -1]
+        u = (L @ psi.unsqueeze(-1)).squeeze(-1)
+        g = u / (u[:, 0:1] + 1e-8)
 
-    absG = G_tf.abs()
-    thr = 3 * absG.mean(dim=0, keepdim=True)
-    mask = absG > thr
-    G_tf = G_tf.clone()
-    G_tf[mask] = (torch.randint(0, 2, (mask.sum(),), device=G_tf.device) * 2 - 1).to(G_tf.dtype)
+        # Outlier replacement per-frame per-channel
+        for m in range(1, M):
+            col = g[:, m]
+            thr = 3.0 * col.abs().mean()
+            mask = col.abs() > thr
+            n_out = mask.sum().item()
+            if n_out > 0:
+                signs = 2.0 * torch.bernoulli(0.5 * torch.ones(n_out, device=device)) - 1.0
+                g[mask, m] = signs.to(cdtype)
 
-    reir_matrix = torch.zeros((2 * (K - 1), Ts, M - 1), dtype=torch.float32, device=device)
-    for m in range(1, M):
-        Gm = G_tf[:, :, m]
-        reir_matrix[:, :, m - 1] = torch.fft.irfft(Gm, dim=0).to(torch.float32)
+        G_tf[:, t, :] = g
 
-    return torch.fft.ifftshift(reir_matrix, dim=0).permute(2,1,0)
+    # No spatial info at DC; Nyquist often noisy
+    G_tf[0, :, :] = 0
+    G_tf[-1, :, :] = 0
+
+    reir_matrix = torch.fft.irfft(G_tf[:, :, 1:], dim=0).to(torch.float32)
+    return torch.fft.ifftshift(reir_matrix, dim=0).permute(2, 1, 0)
 
 def rtf_to_reir(rtf, F_L=None, F_R=None):
     M, K, T = rtf.shape

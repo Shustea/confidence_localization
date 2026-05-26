@@ -274,8 +274,181 @@ def fix_ptpt_files(directory):
                 print(f"Failed to delete {filename}: {e}")
 
 
+# --- LOCATA caching --------------------------------------------------------
+
+LOCATA_SINGLE_SOURCE_TASKS = (1, 3, 5)
+
+
+def _locata_base(locata_root, split):
+    from pathlib import Path
+    base = Path(locata_root)
+    if (base / split).exists():
+        return base / split
+    if (base / "LOCATA" / split).exists():
+        return base / "LOCATA" / split
+    raise FileNotFoundError(f"Could not find '{split}' under '{locata_root}'.")
+
+
+def _discover_locata_pairs(locata_root, split, array, tasks=LOCATA_SINGLE_SOURCE_TASKS):
+    base = _locata_base(locata_root, split)
+    pairs = []
+    for t in tasks:
+        td = base / f"task{t}"
+        if not td.exists():
+            continue
+        for rd in sorted(td.iterdir()):
+            if not (rd.is_dir() and rd.name.startswith("recording") and (rd / array).exists()):
+                continue
+            try:
+                r = int(rd.name.replace("recording", ""))
+            except ValueError:
+                continue
+            pairs.append((t, r))
+    return pairs
+
+
+def _parse_locata_pairs(value):
+    """Accept ``'1:1,1:2,3:1'`` strings or ``[[1,1],[1,2],...]`` / ``[{'task':1,'recording':1},...]`` lists."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        out = []
+        for item in value.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            t, r = item.split(":")
+            out.append((int(t), int(r)))
+        return out
+    out = []
+    for item in value:
+        if isinstance(item, dict):
+            out.append((int(item["task"]), int(item["recording"])))
+        else:
+            t, r = item
+            out.append((int(t), int(r)))
+    return out
+
+
+def _resample_audio(wav, fs_in, fs_out):
+    if int(fs_in) == int(fs_out):
+        return wav
+    import torchaudio.functional as taF
+    return taF.resample(wav, int(fs_in), int(fs_out))
+
+
+def _cache_one_locata(
+    cfg, locata_root, split, task, recording, array, channels, out_dir, index, overwrite,
+):
+    # Local imports — these modules are only needed when caching LOCATA.
+    from eval_utils import (
+        build_locata_labels,
+        cache_file_path,
+        load_locata_waveform,
+        normalize_rtf,
+        preprocess_waveform,
+        save_cached_sample,
+    )
+    from confidence_localization_dataloader import _vad_from_waveform
+
+    wav, sample_rate, title, _ = load_locata_waveform(
+        str(locata_root), split, task, recording, array, channels,
+    )
+    wav = wav.float()
+    wav = _resample_audio(wav, int(sample_rate), int(cfg.fs))
+    rtf = preprocess_waveform(cfg, wav, sample_rate=int(cfg.fs), normalize=False)
+    rtf = normalize_rtf(rtf)
+    labels = build_locata_labels(
+        str(locata_root), split, task, recording, array, rtf.shape[1],
+    )
+    vad = _vad_from_waveform(cfg, wav, int(cfg.fs), rtf.shape[1])
+    out_path = cache_file_path(str(out_dir), index, title)
+    saved = save_cached_sample(out_path, rtf, labels, title, vad=vad, overwrite=overwrite)
+    return out_path, saved, tuple(rtf.shape), int(labels.shape[0]), int(vad.sum().item())
+
+
+def _stage_locata_cfg(cfg, stage):
+    data = cfg.get("data") if hasattr(cfg, "get") else None
+    if data is None or stage not in data:
+        return None
+    section = data[stage]
+    return section.get("locata") if hasattr(section, "get") else getattr(section, "locata", None)
+
+
+def create_locata_cache(cfg):
+    """Cache LOCATA recordings into ``cfg.data.<stage>.locata.cache_root`` for each stage.
+
+    Per-stage settings (under ``cfg.data.<stage>.locata``):
+        * ``root``         — LOCATA raw root (defaults to ``cfg.locata_root``).
+        * ``split``        — ``dev`` | ``eval``.
+        * ``array``        — array name (default ``eigenmike``).
+        * ``channels``     — 0-indexed channel list to extract.
+        * ``cache_root``   — output directory for the cache.
+        * ``pairs``        — optional list of ``[task, recording]`` (or
+          ``"task:rec,..."``). Falls back to every single-source eigenmike
+          recording under the split.
+        * ``overwrite``    — bool, default False.
+
+    Pull the run via the make_dataset CLI:
+        python data/make_dataset.py +cache_locata=true
+        # optional CLI overrides:
+        python data/make_dataset.py +cache_locata=true \\
+            +data.train.locata.pairs='1:1,1:2,1:3,3:1' \\
+            +data.val.locata.pairs='3:2,3:3,5:1,5:2,5:3'
+    """
+    stages = []
+    for stage in ("train", "val", "eval", "test"):
+        locata_cfg = _stage_locata_cfg(cfg, stage)
+        if locata_cfg is None:
+            continue
+        if locata_cfg.get("cache_root", None) is None:
+            print(f"[locata-cache] {stage}: no cache_root set — skipping.")
+            continue
+        stages.append((stage, locata_cfg))
+
+    if not stages:
+        print("[locata-cache] no LOCATA stages configured under cfg.data.*.locata — nothing to do.")
+        return
+
+    for stage, locata_cfg in stages:
+        root = locata_cfg.get("root", None) or cfg.locata_root
+        split = str(locata_cfg.get("split", "dev"))
+        array = str(locata_cfg.get("array", "eigenmike"))
+        channels = list(locata_cfg.get("channels", [0, 1]))
+        cache_root = locata_cfg.get("cache_root")
+        overwrite = bool(locata_cfg.get("overwrite", False))
+
+        pairs = _parse_locata_pairs(locata_cfg.get("pairs", None))
+        if pairs is None:
+            pairs = _discover_locata_pairs(root, split, array)
+
+        if not pairs:
+            print(f"[locata-cache] {stage}: no recordings found in {root}/{split} for {array}.")
+            continue
+
+        os.makedirs(cache_root, exist_ok=True)
+        print(f"[locata-cache] {stage}: caching {len(pairs)} recording(s) -> {cache_root}")
+        n_written = 0
+        for idx, (t, r) in enumerate(pairs):
+            try:
+                path, saved, rtf_shape, n_labels, n_vad = _cache_one_locata(
+                    cfg, root, split, t, r, array, channels, cache_root, idx, overwrite,
+                )
+            except Exception as exc:
+                print(f"  task{t} rec{r}: SKIP ({exc})")
+                continue
+            status = "wrote" if saved else "skip (exists)"
+            n_written += int(saved)
+            print(f"  task{t} rec{r}: {status} {path.name}  rtf={rtf_shape}  "
+                  f"labels={n_labels}  vad_active={n_vad}")
+        print(f"[locata-cache] {stage}: done ({n_written}/{len(pairs)} written).")
+
+
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
 def main(cfg, convert_wv12wav_flag=False, create_data_flag=False, preprocess_flag=True):
+    if bool(cfg.get("cache_locata", False)):
+        create_locata_cache(cfg)
+        return
     if convert_wv12wav_flag:
         convert_wv12wav(cfg)
     if create_data_flag:
