@@ -14,14 +14,16 @@ def save_sample_as_image(
     spectrum: torch.Tensor = None,
     title: str = None,
     path: str = '/workspaces/confidence_localization/samples/',
+    waveform: torch.Tensor = None,
+    fs: int = None,
 ):
     """Save a publication-quality DOA evaluation figure.
 
-    Top panel: azimuth estimate with ±1σ confidence band vs. ground truth.
-    Second panel: absolute angular error and predicted confidence bound.
-    Third panel (optional): a 1D REIR slice at the middle time frame, with one
-    line per channel, when ``spectrum`` is provided with shape
-    ``[C, T, Freq/Lag]``.
+    Optional WAV panel (top): channel-0 waveform when ``waveform`` (and ``fs``)
+    are supplied. Required panels: azimuth estimate with ±1σ confidence band
+    vs. ground truth; absolute angular error and predicted confidence bound.
+    Optional REIR slice (bottom): 1D REIR at the middle time frame, with one
+    line per channel, when ``spectrum`` has shape ``[C, T, Freq/Lag]``.
     """
     tensor = tensor.squeeze().detach().cpu().float()
     label = label.squeeze().detach().cpu().float()
@@ -75,10 +77,26 @@ def save_sample_as_image(
         if reir.ndim != 3:
             reir = None
 
+    wav_np = None
+    if waveform is not None:
+        wav_t = waveform.detach().cpu().float().squeeze()
+        if wav_t.ndim > 1:
+            wav_t = wav_t[0]
+        if wav_t.numel() > 1:
+            wav_np = wav_t.numpy()
+
     has_reir = reir is not None
-    n_rows = 3 if has_reir else 2
-    height_ratios = [3, 2, 2] if has_reir else [3, 2]
-    fig_h = 7.5 if has_reir else 5.5
+    has_wav = wav_np is not None
+
+    # Build panel layout: optional wav (top), required azimuth+error, optional REIR.
+    height_ratios = []
+    if has_wav:
+        height_ratios.append(2)
+    height_ratios.extend([3, 2])           # azimuth, error
+    if has_reir:
+        height_ratios.append(2)
+    n_rows = len(height_ratios)
+    fig_h = 1.6 * n_rows + 1.2
 
     with plt.rc_context(rc):
         fig, axes = plt.subplots(
@@ -87,10 +105,24 @@ def save_sample_as_image(
         )
         if n_rows == 1:
             axes = [axes]
-        fig.subplots_adjust(hspace=0.3)
+        fig.subplots_adjust(hspace=0.35)
         fig.suptitle(filename, fontsize=12, y=0.995)
 
-        ax1, ax2 = axes[0], axes[1]
+        # Resolve panel index map.
+        idx = 0
+        if has_wav:
+            ax_wav = axes[idx]; idx += 1
+            fs_safe = max(1, int(fs)) if fs else 16000
+            t_wav = np.arange(wav_np.shape[0]) / fs_safe
+            ax_wav.plot(t_wav, wav_np, color='#333333', lw=0.6)
+            ax_wav.set_ylabel('ch0')
+            ax_wav.set_title(
+                f'waveform ch0  (fs={fs_safe} Hz, {wav_np.shape[0]} samples)', pad=4,
+            )
+            ax_wav.set_xlim(t_wav[0], t_wav[-1] if t_wav.size > 1 else 1.0)
+            ax_wav.tick_params(labelbottom=True)
+
+        ax1, ax2 = axes[idx], axes[idx + 1]
         ax1.sharex(ax2)
 
         ax1.fill_between(t, doa_deg - bound_deg, doa_deg + bound_deg,
@@ -115,7 +147,7 @@ def save_sample_as_image(
         ax2.legend(loc='upper right', framealpha=0.9, edgecolor='#aaaaaa')
 
         if has_reir:
-            ax3 = axes[2]
+            ax3 = axes[idx + 2]
             C, T_reir, L = reir.shape
             t_mid = T_reir // 2
             lag_axis = np.arange(L) - L // 2

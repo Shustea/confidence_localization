@@ -90,9 +90,11 @@ def _vad_from_waveform(cfg, wav, sample_rate, n_rtf_frames):
 class CLDataset(Dataset):
     """Synthetic dataset: pre-extracted .pt RTF tensors + label inference from filename.
 
-    Returns ``(rtf, labels, title, vad)``. VAD is all-ones for synthetic since the
-    speech occupies the full sample (modulo the ``pre_speech_noise_time`` prelude
-    which is already trimmed inside ``estimate_rtf``).
+    Returns ``(rtf, labels, title, vad, wav_ch0)``. VAD is all-ones for synthetic
+    since the speech occupies the full sample (modulo the ``pre_speech_noise_time``
+    prelude which is already trimmed inside ``estimate_rtf``). ``wav_ch0`` is the
+    channel-0 waveform lazy-loaded from the sibling .wav (zeros of the expected
+    length when absent, so collate still stacks deterministically).
     """
 
     def __init__(self, cfg, root_dir, transform=None):
@@ -103,9 +105,27 @@ class CLDataset(Dataset):
         self.sample_files = [
             os.path.join(root_dir, f) for f in os.listdir(root_dir) if f.endswith(".pt")
         ]
+        # The synthetic pipeline's apply_rir_on_sample trims to sample_length_secs
+        # (the noise prefix is folded into the RTF whitening window, not the wav),
+        # so the on-disk .wav has this many samples per channel.
+        self._expected_wav_len = int(round(float(cfg.fs) * float(cfg.sample_length_secs)))
 
     def __len__(self):
         return len(self.sample_files)
+
+    def _load_wav_ch0(self, sample_name: str) -> torch.Tensor:
+        wav_path = sample_name.replace(".pt", ".wav")
+        if os.path.exists(wav_path):
+            try:
+                audio, _ = sf.read(wav_path, dtype="float32", always_2d=True)
+                ch0 = torch.from_numpy(audio[:, 0])
+                if ch0.shape[0] >= self._expected_wav_len:
+                    return ch0[: self._expected_wav_len]
+                pad = self._expected_wav_len - ch0.shape[0]
+                return torch.cat([ch0, torch.zeros(pad, dtype=ch0.dtype)])
+            except Exception:
+                pass
+        return torch.zeros(self._expected_wav_len, dtype=torch.float32)
 
     def __getitem__(self, idx):
         sample_name = self.sample_files[idx]
@@ -118,7 +138,8 @@ class CLDataset(Dataset):
         labels = assign_gt_to_tf_bin(self.cfg, rtf[0].shape, sample_name, self.classification)
         rtf = _apply_feature_pipeline(rtf, self.transform)
         vad = torch.ones(rtf.shape[1], dtype=torch.bool)
-        return rtf, labels, str(title)[8:-2], vad
+        wav_ch0 = self._load_wav_ch0(sample_name)
+        return rtf, labels, str(title)[8:-2], vad, wav_ch0
 
 
 class CachedExternalDataset(Dataset):
@@ -157,7 +178,9 @@ class CachedExternalDataset(Dataset):
             vad = vad.to(torch.bool)
         if self.target_frames is not None:
             rtf, labels, vad = self._pad_or_truncate(rtf, labels, vad)
-        return _apply_feature_pipeline(rtf, self.transform), labels, title, vad
+        # No wav cached for this dataset; return a sentinel.
+        wav_ch0 = torch.zeros(1, dtype=torch.float32)
+        return _apply_feature_pipeline(rtf, self.transform), labels, title, vad, wav_ch0
 
 
 class RealMANDataset(Dataset):
@@ -190,7 +213,8 @@ class RealMANDataset(Dataset):
         rtf = preprocess_waveform(self.cfg, wav, sample_rate=sample_rate, normalize=False)
         labels = build_realman_labels(row, rtf.shape[1])
         vad = _vad_from_waveform(self.cfg, wav, sample_rate, rtf.shape[1])
-        return _apply_feature_pipeline(rtf, self.transform), labels, title, vad
+        wav_ch0 = wav[0].float()
+        return _apply_feature_pipeline(rtf, self.transform), labels, title, vad, wav_ch0
 
 
 class LOCATADataset(Dataset):
@@ -233,7 +257,8 @@ class LOCATADataset(Dataset):
             source_name=self.source_name,
         )
         vad = _vad_from_waveform(self.cfg, wav, sample_rate, rtf.shape[1])
-        return _apply_feature_pipeline(rtf, self.transform), labels, title, vad
+        wav_ch0 = wav[0].float()
+        return _apply_feature_pipeline(rtf, self.transform), labels, title, vad, wav_ch0
 
 
 def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):

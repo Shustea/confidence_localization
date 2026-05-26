@@ -344,6 +344,8 @@ class _RecordingResult:
     rmse_deg: float
     acc_at_10: float
     acc_at_15: float
+    mae_inlier15_deg: float
+    n_inlier15: int
 
 
 def _find_split_root(root: str, split: str) -> Path:
@@ -422,9 +424,13 @@ def _evaluate_recording(
         return _RecordingResult(
             task, recording, array, group, n_frames, 0,
             float("nan"), float("nan"), float("nan"), float("nan"),
+            float("nan"), 0,
         )
 
     err = _angular_error_deg(estimate, labels.astype(np.float64))[valid]
+    inlier15 = err <= 15.0
+    n_inlier15 = int(inlier15.sum())
+    mae_inlier15_deg = float(err[inlier15].mean()) if n_inlier15 > 0 else float("nan")
     return _RecordingResult(
         task=task, recording=recording, array=array, group=group,
         n_frames=n_frames, n_valid=int(valid.sum()),
@@ -432,6 +438,8 @@ def _evaluate_recording(
         rmse_deg=float(np.sqrt((err ** 2).mean())),
         acc_at_10=float((err <= 10.0).mean()),
         acc_at_15=float((err <= 15.0).mean()),
+        mae_inlier15_deg=mae_inlier15_deg,
+        n_inlier15=n_inlier15,
     )
 
 
@@ -599,10 +607,22 @@ def _aggregate(results: list[_RecordingResult]) -> dict[str, dict[str, float]]:
         rmse = np.array([r.rmse_deg for r in items], dtype=np.float64)
         acc10 = np.array([r.acc_at_10 for r in items], dtype=np.float64)
         acc15 = np.array([r.acc_at_15 for r in items], dtype=np.float64)
+        inlier_weights = np.array([r.n_inlier15 for r in items], dtype=np.float64)
+        mae_inlier15 = np.array([r.mae_inlier15_deg for r in items], dtype=np.float64)
         mask = (weights > 0) & np.isfinite(mae)
         if not mask.any():
             continue
         w = weights[mask]
+        # Inlier aggregate: weight by per-recording inlier counts so groups with
+        # few inliers don't dominate; NaN-safe when no recordings have any inliers.
+        inlier_mask = mask & (inlier_weights > 0) & np.isfinite(mae_inlier15)
+        if inlier_mask.any():
+            iw = inlier_weights[inlier_mask]
+            mae_inlier15_group = float((mae_inlier15[inlier_mask] * iw).sum() / iw.sum())
+            n_inlier15_group = int(iw.sum())
+        else:
+            mae_inlier15_group = float("nan")
+            n_inlier15_group = 0
         out[group] = {
             "n_recordings": int(mask.sum()),
             "n_frames": int(w.sum()),
@@ -610,6 +630,8 @@ def _aggregate(results: list[_RecordingResult]) -> dict[str, dict[str, float]]:
             "rmse_deg": float(np.sqrt((rmse[mask] ** 2 * w).sum() / w.sum())),
             "acc_at_10": float((acc10[mask] * w).sum() / w.sum()),
             "acc_at_15": float((acc15[mask] * w).sum() / w.sum()),
+            "mae_inlier15_deg": mae_inlier15_group,
+            "n_inlier15": n_inlier15_group,
         }
     return out
 
@@ -620,7 +642,8 @@ def _write_per_recording_csv(rows: list[_RecordingResult], path: Path) -> None:
         w = csv.writer(f)
         w.writerow([
             "group", "task", "recording", "array",
-            "n_frames", "n_valid", "mae_deg", "rmse_deg", "acc_at_10", "acc_at_15",
+            "n_frames", "n_valid", "mae_deg", "rmse_deg",
+            "acc_at_10", "acc_at_15", "mae_inlier15_deg", "n_inlier15",
         ])
         for r in rows:
             w.writerow([
@@ -628,6 +651,7 @@ def _write_per_recording_csv(rows: list[_RecordingResult], path: Path) -> None:
                 r.n_frames, r.n_valid,
                 f"{r.mae_deg:.4f}", f"{r.rmse_deg:.4f}",
                 f"{r.acc_at_10:.4f}", f"{r.acc_at_15:.4f}",
+                f"{r.mae_inlier15_deg:.4f}", r.n_inlier15,
             ])
 
 
@@ -636,7 +660,8 @@ def _write_aggregate_csv(aggregates: dict[str, dict[str, float]], path: Path) ->
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["group", "n_recordings", "n_frames",
-                    "mae_deg", "rmse_deg", "acc_at_10", "acc_at_15"])
+                    "mae_deg", "rmse_deg", "acc_at_10", "acc_at_15",
+                    "mae_inlier15_deg", "n_inlier15"])
         for group in ("static", "moving", "all"):
             if group not in aggregates:
                 continue
@@ -645,6 +670,7 @@ def _write_aggregate_csv(aggregates: dict[str, dict[str, float]], path: Path) ->
                 group, a["n_recordings"], a["n_frames"],
                 f"{a['mae_deg']:.4f}", f"{a['rmse_deg']:.4f}",
                 f"{a['acc_at_10']:.4f}", f"{a['acc_at_15']:.4f}",
+                f"{a['mae_inlier15_deg']:.4f}", a["n_inlier15"],
             ])
 
 
@@ -794,9 +820,13 @@ def main() -> None:
         if r is None:
             continue
         results.append(r)
+        mae15_str = (
+            f"{r.mae_inlier15_deg:5.2f}°" if r.n_inlier15 > 0 else "  n/a"
+        )
         print(
             f"  task{task} rec{rec} [{group:>6s}]: "
             f"MAE={r.mae_deg:6.2f}°  RMSE={r.rmse_deg:6.2f}°  "
+            f"MAE@15={mae15_str} ({r.n_inlier15}/{r.n_valid})  "
             f"acc@10={100 * r.acc_at_10:5.1f}%  acc@15={100 * r.acc_at_15:5.1f}%  "
             f"({r.n_valid}/{r.n_frames} frames)"
         )
@@ -817,8 +847,12 @@ def main() -> None:
         if group not in aggregates:
             continue
         a = aggregates[group]
+        mae15_str = (
+            f"{a['mae_inlier15_deg']:5.2f}°" if a["n_inlier15"] > 0 else "  n/a"
+        )
         print(
             f"  {group:>6s}: MAE={a['mae_deg']:6.2f}°  RMSE={a['rmse_deg']:6.2f}°  "
+            f"MAE@15={mae15_str} ({a['n_inlier15']} inliers)  "
             f"acc@10={100 * a['acc_at_10']:5.1f}%  acc@15={100 * a['acc_at_15']:5.1f}%  "
             f"({a['n_recordings']} recs, {a['n_frames']} frames)"
         )

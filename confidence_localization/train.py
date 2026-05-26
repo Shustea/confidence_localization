@@ -258,7 +258,7 @@ class DOAMAMBA(pl.LightningModule):
         return loss_main, mae, None
 
     def training_step(self, batch, batch_idx):
-        spectrum, labels, _, vad = batch
+        spectrum, labels, _, vad, _wav = batch
 
         doa, log_std = self(spectrum)
 
@@ -287,7 +287,7 @@ class DOAMAMBA(pl.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        spectrum, labels, title, vad = batch
+        spectrum, labels, title, vad, wav = batch
         B = spectrum.size(0)
 
         doa_unit, log_std = self(spectrum)
@@ -296,12 +296,18 @@ class DOAMAMBA(pl.LightningModule):
 
         if batch_idx == 0 and labels.size(0) > 1:
             bound = log_std[1].squeeze(-1).exp()
+            example_wav = wav[1].cpu()
+            # Drop the sentinel zero-tensor that non-synthetic datasets emit.
+            if example_wav.numel() <= 1:
+                example_wav = None
             save_sample_as_image(
                 doa[1].cpu(),
                 labels[1].cpu(),
                 bound.cpu(),
                 filename="DOA_1_example.png",
                 spectrum=spectrum[1].cpu(),
+                waveform=example_wav,
+                fs=int(self.cfg.fs),
             )
             save_room_geometry(
                 labels=labels[1].cpu(),

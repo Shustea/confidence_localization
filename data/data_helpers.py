@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import librosa
 import soundfile as sf
@@ -14,6 +15,85 @@ def compute_nb_img(room_sz, Tmax, c=340):
     max_dist = c * Tmax
     return np.ceil(max_dist / np.array(room_sz)).astype(int)
 
+
+# --- Per-sample domain randomization helpers --------------------------------
+
+def _data_randomization(args):
+    """Return the cfg.data_randomization sub-block (or None if absent)."""
+    return getattr(args, "data_randomization", None)
+
+
+def _sample_room_dim(args):
+    """Sample (width, depth, height) in m from cfg.data_randomization ranges,
+    falling back to cfg.room_dim if randomization is not configured."""
+    rr = _data_randomization(args)
+    if rr is None:
+        return list(args.room_dim)
+    return [
+        float(np.random.uniform(*rr.room_w_range)),
+        float(np.random.uniform(*rr.room_d_range)),
+        float(np.random.uniform(*rr.room_h_range)),
+    ]
+
+
+def _sample_array_geometry(args, room_dim):
+    """Per-sample mic positions = re-centered template, yaw-rotated around z,
+    translated to a random centroid within the room (with margin).
+
+    Returns (absolute_positions [M, 3], centroid [3]).
+    """
+    rr = _data_randomization(args)
+    template = np.asarray(args.receivers_coords, dtype=np.float64)
+    template = template - template.mean(axis=0, keepdims=True)
+
+    if rr is None:
+        return template + np.array([room_dim[0] / 2, room_dim[1] / 2, template.mean(axis=0)[2]]), template.mean(axis=0)
+
+    yaw = float(np.random.uniform(*rr.array_yaw_range))
+    R = np.array([
+        [np.cos(yaw), -np.sin(yaw), 0.0],
+        [np.sin(yaw),  np.cos(yaw), 0.0],
+        [0.0,          0.0,         1.0],
+    ], dtype=np.float64)
+    rotated = template @ R.T
+
+    margin = float(rr.array_centroid_margin)
+    cx = float(np.random.uniform(margin, room_dim[0] - margin))
+    cy = float(np.random.uniform(margin, room_dim[1] - margin))
+    cz = float(np.random.uniform(*rr.array_height_range))
+    centroid = np.array([cx, cy, cz], dtype=np.float64)
+    return rotated + centroid, centroid
+
+
+def _sample_source_position(args, room_dim, mic_centroid):
+    """Sample (doa, dist, start_pos) with adaptive radius bounds so the source
+    stays inside the room with the configured wall margin."""
+    rr = _data_randomization(args)
+    if rr is None:
+        doa = float(np.random.uniform(0, 2 * np.pi))
+        dist = float(np.random.uniform(1.5, 2.15))
+        height = float(np.random.uniform(1.65, 1.85))
+    else:
+        margin = float(rr.source_radius_margin)
+        max_radius = min(
+            mic_centroid[0] - margin,
+            mic_centroid[1] - margin,
+            room_dim[0] - mic_centroid[0] - margin,
+            room_dim[1] - mic_centroid[1] - margin,
+        )
+        max_radius = max(margin + 0.1, max_radius)
+        doa = float(np.random.uniform(0, 2 * np.pi))
+        dist = float(np.random.uniform(margin, max_radius))
+        height = float(np.random.uniform(*rr.source_height_range))
+
+    start_pos = np.array([
+        mic_centroid[0] + dist * np.cos(doa),
+        mic_centroid[1] + dist * np.sin(doa),
+        height,
+    ], dtype=np.float64)
+    return doa, dist, start_pos
+
+
 def mix_signal(args):
     snr = np.random.uniform(args.snr_db - 3, args.snr_db + 3)
 
@@ -23,13 +103,26 @@ def mix_signal(args):
 
     first_file_id = second_file_id = 'NONE'
 
-    beta = [args.beta]      
+    # Per-sample domain randomization: shallow-copy args so we don't mutate the
+    # shared Hydra cfg, then sample fresh room / array / beta. Downstream callees
+    # (generate_speaker_sample, apply_rir_on_sample, add_pink_noise,
+    # add_diffuse_noise) all read args.room_dim / args.receivers_coords /
+    # args.beta — they pick up the overrides automatically.
+    rr = _data_randomization(args)
+    if rr is not None:
+        args = copy.copy(args)
+        args.room_dim = _sample_room_dim(args)
+        mic_positions, _mic_centroid = _sample_array_geometry(args, args.room_dim)
+        args.receivers_coords = mic_positions.tolist()
+        args.beta = float(np.random.uniform(*rr.beta_range))
+
+    beta = [args.beta]
 
     mixed_signal, first_file_id, sp_path = generate_speaker_sample(args, speakers_dirs, beta)
-    
+
     mixed_signal, noise_type = add_pink_noise(mixed_signal, sp_path,args, snr_db=snr)
 
-    mix_id = f"{first_file_id}-{second_file_id}-beta{args.beta}-{noise_type}#"
+    mix_id = f"{first_file_id}-{second_file_id}-beta{args.beta:.2f}-{noise_type}#"
     return mixed_signal, mix_id
 
 def get_speaker_dirs(wav_path):
@@ -56,8 +149,7 @@ def generate_speaker_sample(args, speakers_dirs, beta):
 
     mic_centers = np.array(args.receivers_coords).mean(0)
 
-    doa, dist = np.random.uniform(0, 2 * np.pi), np.random.uniform(1.5, 2.15)
-    start_pos = np.array([mic_centers[0] + dist * np.cos(doa), mic_centers[1] + dist * np.sin(doa), np.random.uniform(1.65, 1.85)])
+    doa, dist, start_pos = _sample_source_position(args, args.room_dim, mic_centers)
 
     walk_mode = np.random.rand()
 
