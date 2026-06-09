@@ -78,6 +78,16 @@ win_len : 8
 overlap : 0.75
 exp_window_smoothing : 0.9
 
+# RTF noise-covariance estimation in estimate_rtf:
+#   prefix  — legacy: first pre_speech_noise_time seconds are noise, dropped
+#             from the signal. Correct for the synthetic generator only.
+#   energy  — pick the lowest-energy frames anywhere as the noise reference and
+#             keep ALL frames as signal. Robust for real RealMAN/LOCATA data.
+# The real-data cache builders override this to "energy"; synthetic preprocess
+# leaves it at the default below.
+rtf_noise_mode: prefix
+rtf_noise_percentile: 0.15   # energy mode: fraction of lowest-energy frames used as noise
+
 eps: 1e-6
 
 input_dim : 1024
@@ -89,6 +99,10 @@ conv_dim : 4
 layers : [2, 4, 4, 4]
 res_alpha : 0.1
 log_var_weight : 1
+# log_std head output bounds (sigma = exp(log_std)); replaces the old fixed
+# Tanh range of [-1, 1]. [-4, 1.5] -> sigma in ~[1deg, 256deg].
+log_std_min : -4.0
+log_std_max : 1.5
 
 lr : 5e-4
 weight_decay: 1e-5

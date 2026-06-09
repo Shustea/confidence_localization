@@ -76,6 +76,13 @@ def _cache_one(args):
             root, row, channels, use_noisy=use_noisy,
         )
         wav = wav.float()
+        # RealMAN is 48 kHz; resample to cfg.fs so the REIR lag scale matches
+        # the synthetic / LOCATA pipelines (all features share one sample rate).
+        target_fs = int(cfg.fs)
+        if int(sample_rate) != target_fs:
+            import torchaudio.functional as taF
+            wav = taF.resample(wav, int(sample_rate), target_fs)
+            sample_rate = target_fs
         rtf = preprocess_waveform(
             cfg, wav, sample_rate=int(sample_rate), normalize=False,
         )
@@ -157,9 +164,17 @@ def main():
     p.add_argument("--splits", default="train,val,eval",
                    help="Comma-separated subset of splits to (re)build. Other splits "
                         "are untouched. E.g. --splits train to rebuild just train.")
+    p.add_argument("--rtf-noise-mode", default="energy",
+                   choices=("energy", "prefix"),
+                   help="Noise-covariance estimation for the RTF front-end. Real "
+                        "RealMAN recordings have no clean pre-speech segment, so "
+                        "'energy' (lowest-energy frames) is the correct default.")
     args = p.parse_args()
 
     cfg = OmegaConf.load(args.config)
+    # Real recordings have no guaranteed noise prefix -> use energy-gated noise.
+    cfg.rtf_noise_mode = args.rtf_noise_mode
+    print(f"[front-end] rtf_noise_mode = {cfg.rtf_noise_mode}")
     realman_root = str(cfg.realman_root)
     realman_target = Path(str(cfg.realman_target))
 

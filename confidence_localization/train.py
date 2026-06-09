@@ -143,9 +143,13 @@ class DOAMAMBA(pl.LightningModule):
             nn.Linear(cfg.input_dim, 2), nn.Tanh()  # output in [-1, 1]
         )
 
-        self.log_std = nn.Sequential(
-            nn.Linear(cfg.input_dim, 1), nn.Tanh()  # output in [-1, 1]
-        )
+        # Raw linear head; the bounded mapping to [log_std_min, log_std_max] is
+        # applied in forward(). Wider than the old Tanh's fixed [-1, 1] so the
+        # model can express genuine high confidence (small sigma) once the head
+        # is supervised. sigma = exp(log_std).
+        self.log_std = nn.Linear(cfg.input_dim, 1)
+        self.log_std_min = float(getattr(cfg, "log_std_min", -4.0))   # sigma ~ 1.0 deg
+        self.log_std_max = float(getattr(cfg, "log_std_max", 1.5))    # sigma ~ 256 deg
 
         self.reset_parameters()
 
@@ -167,7 +171,12 @@ class DOAMAMBA(pl.LightningModule):
 
         x_hat = F.gelu(self.hidden(F.normalize(x, dim=-1)).squeeze(-1)).permute(0, 2, 1)
         doa_vec = self.doa(x_hat)
-        return F.normalize(doa_vec, dim=-1), self.log_std(x_hat)
+        # Map raw log_std linearly through tanh into [log_std_min, log_std_max].
+        raw = self.log_std(x_hat)
+        log_std = self.log_std_min + (self.log_std_max - self.log_std_min) * 0.5 * (
+            1.0 + torch.tanh(raw)
+        )
+        return F.normalize(doa_vec, dim=-1), log_std
 
     def circ_error(self, angle):
         return ((angle + torch.pi) % (2 * torch.pi) - torch.pi).abs()

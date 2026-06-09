@@ -295,12 +295,41 @@ def _read_realman_archive_audio(archive_path: Path, member_path: Path):
     return torch.from_numpy(audio[:, 0]), sample_rate
 
 
+def _resolve_realman_perchannel_base(root: str, relative: str, first_channel: int) -> Optional[Path]:
+    """Return a base path whose ``_CH{first_channel}`` variant exists on disk.
+
+    RealMAN stores one .flac per channel (``<stem>_CH{n}.flac``); there is no
+    base file without a channel suffix. So we resolve by probing the first
+    channel's file across the same candidate roots ``_resolve_realman_recording``
+    uses, then the caller appends ``_CH{n}`` for every requested channel.
+    """
+    root_path = Path(root)
+    rel = Path(str(relative))
+    candidates = [root_path / rel]
+    if rel.parts:
+        candidates.extend([
+            root_path / Path(*rel.parts[1:]),
+            root_path / rel.parts[0] / Path(*rel.parts[1:]),
+            root_path / "RealMAN" / rel,
+            root_path / "RealMAN" / Path(*rel.parts[1:]),
+        ])
+    for base in candidates:
+        ch_path = base.with_name(f"{base.stem}_CH{first_channel}{base.suffix}")
+        if ch_path.exists():
+            return base
+    return None
+
+
 def load_realman_waveform(root: str, row, channels: Sequence[int], use_noisy: Optional[bool] = None):
     relative = str(row["filename"])
     if use_noisy is not None:
         relative = relative.replace("ma_noisy_speech", "ma_noisy_speech" if use_noisy else "ma_speech")
 
-    base_path = _resolve_realman_recording(root, relative, strict=False)
+    # Extracted per-channel layout: resolve via the first channel's _CH file
+    # (the bare base file never exists for RealMAN).
+    base_path = _resolve_realman_perchannel_base(root, relative, channels[0]) if channels else None
+    if base_path is None:
+        base_path = _resolve_realman_recording(root, relative, strict=False)
     if base_path is not None:
         paths = [base_path.with_name(f"{base_path.stem}_CH{channel}{base_path.suffix}") for channel in channels]
 

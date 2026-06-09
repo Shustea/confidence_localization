@@ -479,21 +479,40 @@ def estimate_rtf(cfg, spectrums, epsilon=0.01):
     device, cdtype = spectrums.device, spectrums.dtype
 
     K = min(F, cfg.nfft // 2 + 1)
-    hop = (1.0 - cfg.overlap) * cfg.nfft
-    Tn = int(np.ceil(cfg.pre_speech_noise_time * cfg.fs / hop))
-    Tn = max(0, min(Tn, T - 1))
-
-    z_n = spectrums[:, :K, :Tn]
-    z_s = spectrums[:, :K, Tn:]
-    Ts = z_s.shape[-1]
-
     I = torch.eye(M, device=device, dtype=cdtype)
 
-    if Tn > 0:
-        Xn = z_n.permute(1, 0, 2)
+    noise_mode = str(getattr(cfg, "rtf_noise_mode", "prefix")).lower()
+
+    if noise_mode == "energy":
+        # Energy-gated noise estimation: pick the lowest-energy frames anywhere
+        # in the recording as the noise reference. Robust when there is no clean
+        # pre-speech segment (real RealMAN / LOCATA recordings). ALL frames are
+        # kept as signal — we never drop the front of a real recording.
+        z_s = spectrums[:, :K, :]
+        Ts = T
+        frame_energy = (z_s.real ** 2 + z_s.imag ** 2).sum(dim=(0, 1))  # [T]
+        p = float(getattr(cfg, "rtf_noise_percentile", 0.15))
+        n_noise = int(max(2, min(T, round(p * T))))
+        noise_idx = torch.topk(frame_energy, n_noise, largest=False).indices
+        Xn = z_s[:, :, noise_idx].permute(1, 0, 2)            # [K, M, n_noise]
         Rv = (Xn @ Xn.conj().transpose(-1, -2)) / Xn.shape[-1]
     else:
-        Rv = epsilon * I.unsqueeze(0).expand(K, -1, -1).clone()
+        # Legacy "prefix" mode: assume the first Tn frames are noise-only and
+        # drop them from the signal. Valid for the synthetic generator, which
+        # prepends pre_speech_noise_time seconds of noise before the speech.
+        hop = (1.0 - cfg.overlap) * cfg.nfft
+        Tn = int(np.ceil(cfg.pre_speech_noise_time * cfg.fs / hop))
+        Tn = max(0, min(Tn, T - 1))
+
+        z_n = spectrums[:, :K, :Tn]
+        z_s = spectrums[:, :K, Tn:]
+        Ts = z_s.shape[-1]
+
+        if Tn > 0:
+            Xn = z_n.permute(1, 0, 2)
+            Rv = (Xn @ Xn.conj().transpose(-1, -2)) / Xn.shape[-1]
+        else:
+            Rv = epsilon * I.unsqueeze(0).expand(K, -1, -1).clone()
 
     # Symmetrize and Cholesky-factorize. Use UNREGULARIZED L for the back-transform
     # and a SEPARATE regularized L_reg for the whitening (matches MATLAB convention).
