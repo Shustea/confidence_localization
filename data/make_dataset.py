@@ -449,11 +449,15 @@ def main(cfg, convert_wv12wav_flag=False, create_data_flag=False, preprocess_fla
     if bool(cfg.get("cache_locata", False)):
         create_locata_cache(cfg)
         return
-    if convert_wv12wav_flag:
+    # cfg overrides (Hydra CLI: +create_data=true) win over Python kwargs.
+    do_convert = bool(cfg.get("convert_wv12wav", convert_wv12wav_flag))
+    do_create = bool(cfg.get("create_data", create_data_flag))
+    do_preprocess = bool(cfg.get("preprocess", preprocess_flag))
+    if do_convert:
         convert_wv12wav(cfg)
-    if create_data_flag:
+    if do_create:
         create_data(cfg)
-    if preprocess_flag:
+    if do_preprocess:
         preprocess(cfg)
 
 

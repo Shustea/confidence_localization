@@ -46,12 +46,20 @@ from data.eval_utils import (  # noqa: E402
 
 
 # Channel preset matches config.yaml (5 channels picked from the 32-cap eigenmike).
+# ``eigenmike_cfg_cross`` is a geometry-matched alternative: capsules selected
+# by nearest-unit-direction to the cfg ``receivers_coords`` "+" cross
+# (center=apex/+z, +x, +y, -x, -y).  Use it with the classical baselines; the
+# DOAMAMBA checkpoint stays on its trained ``eigenmike`` preset.
+CFG_CROSS_EIGENMIKE_CHANNELS = (28, 22, 0, 26, 18)
 DEFAULT_ARRAY_CHANNELS = {
     "eigenmike": [4, 10, 6, 1, 19],
+    "eigenmike_cfg_cross": list(CFG_CROSS_EIGENMIKE_CHANNELS),
     "dicit": list(range(15)),
     "benchmark2": list(range(12)),
     "dummy": [0, 1],
 }
+# Virtual presets that share another array's on-disk directory layout.
+_PHYSICAL_ARRAY = {"eigenmike_cfg_cross": "eigenmike"}
 
 STATIC_TASKS = (1,)
 MOVING_TASKS = (3, 5)
@@ -67,6 +75,15 @@ class LocalizationAlgorithm:
     """
 
     name: str = "unnamed"
+
+    def set_channels(self, channels: Sequence[int]) -> None:
+        """Optional hook: rebuild internal mic_positions for ``channels``.
+
+        Called once per recording by the harness with the channel list it just
+        sliced out of the wav, so geometry-aware algos (GCC / SRP-PHAT) keep
+        their ``mic_positions`` in sync with the actual loaded channels.
+        Default is a no-op for algos that don't depend on geometry.
+        """
 
     def __call__(self, wav: torch.Tensor, fs: int) -> tuple[np.ndarray, float]:
         """Run the algorithm on a multichannel waveform.
@@ -143,85 +160,118 @@ def eigenmike_mic_positions(channels: Sequence[int]) -> np.ndarray:
     return _EIGENMIKE_LOCATA_XYZ[list(channels)].copy()
 
 
-class GCCPHATBaseline(LocalizationAlgorithm):
-    """Frame-wise SRP-PHAT azimuth via GCC-PHAT across all mic pairs.
+def _resample_torch(wav: torch.Tensor, fs_in: int, fs_out: int) -> torch.Tensor:
+    """Polyphase resample a multichannel float tensor [C, T] via scipy."""
+    if int(fs_in) == int(fs_out):
+        return wav
+    from math import gcd
+    from scipy.signal import resample_poly  # local import; scipy is in env
+    g = gcd(int(fs_in), int(fs_out))
+    up, down = int(fs_out) // g, int(fs_in) // g
+    arr = wav.detach().cpu().numpy().astype(np.float64)
+    out = resample_poly(arr, up, down, axis=-1)
+    return torch.from_numpy(out.astype(np.float32))
 
-    For each frame: compute GCC-PHAT cross-correlations for every unique mic
-    pair, then evaluate a 2-D azimuth grid (elevation = 0) by linearly
-    interpolating each pair's correlation at the far-field-predicted delay.
-    The argmax of the summed score is the azimuth estimate.
 
-    Defaults match the project's eigenmike 5-channel selection
-    (``[4, 10, 6, 1, 19]``). For another array, pass ``mic_positions`` as
-    ``[C, 3]`` Cartesian meters in the array's intrinsic frame
-    (x = +0° azimuth, y = +90°).
+class _PairwisePHATMixin:
+    """Shared scaffolding: framing, PHAT-weighted GCC, optional resampling.
+
+    Sign convention: cc = ifft(X_i * conj(X_j)); centered (fftshifted) cc peaks
+    at lag = delta . u / c * fs  where  delta = r_j - r_i and u is the far-field
+    direction-of-arrival unit vector. So (delta . u) = c * lag / fs.
     """
 
-    name = "gcc_phat"
+    mic_positions: np.ndarray
+    frame_seconds: float
+    hop_seconds: float
+    sound_speed: float
+    target_fs: int | None
+
+    def set_channels(self, channels):
+        self.mic_positions = eigenmike_mic_positions(channels)
+
+    def _prepare(self, wav, fs):
+        if isinstance(wav, np.ndarray):
+            wav = torch.from_numpy(wav)
+        if self.target_fs is not None and int(fs) != int(self.target_fs):
+            wav = _resample_torch(wav.float(), int(fs), int(self.target_fs))
+            fs = int(self.target_fs)
+        x = wav.detach().cpu().numpy().astype(np.float64)
+        C, T = x.shape
+        if C != self.mic_positions.shape[0]:
+            raise ValueError(
+                f"wav has {C} channels but mic_positions has "
+                f"{self.mic_positions.shape[0]} entries — set_channels() wiring "
+                "is out of sync with the loaded waveform."
+            )
+        frame_len = max(2, int(round(self.frame_seconds * fs)))
+        hop_len = max(1, int(round(self.hop_seconds * fs)))
+        n_frames = 1 if T < frame_len else 1 + (T - frame_len) // hop_len
+        n_fft = 1
+        while n_fft < 2 * frame_len:
+            n_fft *= 2
+        return x, int(fs), frame_len, hop_len, n_frames, n_fft
+
+    @staticmethod
+    def _pairs(C: int):
+        pair_iter = [(i, j) for i in range(C) for j in range(i + 1, C)]
+        i_idx = np.fromiter((p[0] for p in pair_iter), dtype=np.int64, count=len(pair_iter))
+        j_idx = np.fromiter((p[1] for p in pair_iter), dtype=np.int64, count=len(pair_iter))
+        return i_idx, j_idx
+
+    @staticmethod
+    def _phat_cc(frame: np.ndarray, n_fft: int, i_idx, j_idx, eps: float = 1e-10):
+        X = np.fft.rfft(frame, n=n_fft, axis=-1)               # [C, K]
+        P = X[i_idx] * np.conj(X[j_idx])                       # [P, K]
+        P /= np.abs(P) + eps                                   # PHAT weighting
+        return np.fft.fftshift(np.fft.irfft(P, n=n_fft, axis=-1), axes=-1)  # [P, n_fft]
+
+
+class GCCBaseline(_PairwisePHATMixin, LocalizationAlgorithm):
+    """Per-pair GCC-PHAT TDOA -> least-squares 3D unit DOA -> azimuth.
+
+    For each frame: PHAT-weighted GCC for every mic pair, take the integer-lag
+    peak (restricted to physically plausible |tau| <= D_max/c) as the pair's
+    TDOA, then solve  delta . u = c * tau  in least squares for unit DOA u
+    where delta = r_j - r_i. Azimuth = atan2(u_y, u_x).
+
+    Distinct from SRP-PHAT, which evaluates a steered grid of candidate
+    directions instead of inverting per-pair peaks. Same array convention as
+    SRPPHATBaseline (x = 0° azimuth, y = 90°).
+    """
+
+    name = "gcc"
 
     def __init__(
         self,
         mic_positions: np.ndarray | None = None,
         frame_ms: float = 64.0,
         hop_ms: float = 32.0,
-        n_azimuth: int = 360,
         sound_speed: float = 343.0,
+        target_fs: int | None = 16000,
     ):
         if mic_positions is None:
-            mic_positions = eigenmike_mic_positions((4, 10, 6, 1, 19))
+            mic_positions = eigenmike_mic_positions(CFG_CROSS_EIGENMIKE_CHANNELS)
         self.mic_positions = np.asarray(mic_positions, dtype=np.float64)
         self.frame_seconds = float(frame_ms) / 1000.0
         self.hop_seconds = float(hop_ms) / 1000.0
-        self.n_azimuth = int(n_azimuth)
         self.sound_speed = float(sound_speed)
+        self.target_fs = int(target_fs) if target_fs else None
 
     def __call__(self, wav, fs):
-        if isinstance(wav, torch.Tensor):
-            x = wav.detach().cpu().numpy().astype(np.float64)
-        else:
-            x = np.asarray(wav, dtype=np.float64)
+        x, fs, frame_len, hop_len, n_frames, n_fft = self._prepare(wav, fs)
         C, T = x.shape
-        if C != self.mic_positions.shape[0]:
-            raise ValueError(
-                f"wav has {C} channels but mic_positions has "
-                f"{self.mic_positions.shape[0]} entries."
-            )
-
-        frame_len = max(2, int(round(self.frame_seconds * fs)))
-        hop_len = max(1, int(round(self.hop_seconds * fs)))
-        n_frames = 1 if T < frame_len else 1 + (T - frame_len) // hop_len
-
-        n_fft = 1
-        while n_fft < 2 * frame_len:
-            n_fft *= 2
         center = n_fft // 2
-
-        azimuths = np.linspace(-np.pi, np.pi, self.n_azimuth, endpoint=False, dtype=np.float64)
-        directions = np.stack(
-            [np.cos(azimuths), np.sin(azimuths), np.zeros_like(azimuths)], axis=-1,
-        )  # [A, 3]
-
-        # All unique (i, j) pairs with i < j
-        pair_iter = [(i, j) for i in range(C) for j in range(i + 1, C)]
-        i_idx = np.fromiter((p[0] for p in pair_iter), dtype=np.int64, count=len(pair_iter))
-        j_idx = np.fromiter((p[1] for p in pair_iter), dtype=np.int64, count=len(pair_iter))
-        n_pairs = i_idx.size
-
-        # Predicted TDOA per (pair, azimuth), in lag-index space.
-        # GCC via IFFT(X_i * conj(X_j)) peaks at lag = -tau_ij where
-        # tau_ij = (r_i - r_j) . u / c, hence the negation below.
+        i_idx, j_idx = self._pairs(C)
         delta = self.mic_positions[j_idx] - self.mic_positions[i_idx]   # [P, 3]
-        tdoa_seconds = (delta @ directions.T) / self.sound_speed         # [P, A]
-        delay_samples = tdoa_seconds * fs + center                       # [P, A]
-        lag0 = np.floor(delay_samples).astype(np.int64)
-        w1 = (delay_samples - lag0).astype(np.float64)
-        w0 = 1.0 - w1
-        lag1 = np.clip(lag0 + 1, 0, n_fft - 1)
-        lag0 = np.clip(lag0, 0, n_fft - 1)
-        rows = np.arange(n_pairs)[:, None]
+
+        # Physical-plausibility window on peak lag: |tau| <= |delta| / c.
+        max_baseline = float(np.linalg.norm(delta, axis=1).max())
+        max_lag = int(np.ceil(max_baseline / self.sound_speed * fs)) + 1
+        lo = max(0, center - max_lag)
+        hi = min(n_fft, center + max_lag + 1)
 
         window = np.hanning(frame_len).astype(np.float64)
-        eps = 1e-10
         out = np.zeros(n_frames, dtype=np.float32)
 
         for k in range(n_frames):
@@ -235,14 +285,97 @@ class GCCPHATBaseline(LocalizationAlgorithm):
                     frame[:, :tail] = x[:, start:start + tail]
                 frame *= window
 
-            X = np.fft.rfft(frame, n=n_fft, axis=-1)              # [C, K]
-            P = X[i_idx] * np.conj(X[j_idx])                       # [P, K]
-            P /= np.abs(P) + eps                                   # PHAT weighting
-            cc = np.fft.fftshift(np.fft.irfft(P, n=n_fft, axis=-1), axes=-1)  # [P, n_fft]
+            cc = self._phat_cc(frame, n_fft, i_idx, j_idx)              # [P, n_fft]
+            peak_lag = np.argmax(cc[:, lo:hi], axis=-1) + lo - center   # [P]
+            tau = peak_lag.astype(np.float64) / fs                       # [P], s
+            u, *_ = np.linalg.lstsq(delta, self.sound_speed * tau, rcond=None)
+            n = float(np.linalg.norm(u))
+            if n > 1e-12:
+                u = u / n
+            out[k] = float(np.arctan2(u[1], u[0]))
+
+        return out, self.hop_seconds
+
+
+class SRPPHATBaseline(_PairwisePHATMixin, LocalizationAlgorithm):
+    """Frame-wise SRP-PHAT azimuth via steered GCC-PHAT across all mic pairs.
+
+    For each frame: PHAT-weighted GCC per pair, then for each azimuth on a
+    uniform grid (elevation = 0) sum the linearly-interpolated correlation at
+    the far-field-predicted lag. argmax of the summed score is the estimate.
+    Use this as the reference baseline; GCCBaseline is its peak-pick variant.
+
+    Defaults to the cfg-cross eigenmike subset (``[28, 22, 0, 26, 18]``);
+    for other arrays pass ``mic_positions`` as ``[C, 3]`` Cartesian meters in
+    the array's intrinsic frame (x = +0° azimuth, y = +90°).
+    """
+
+    name = "srp_phat"
+
+    def __init__(
+        self,
+        mic_positions: np.ndarray | None = None,
+        frame_ms: float = 64.0,
+        hop_ms: float = 32.0,
+        n_azimuth: int = 360,
+        sound_speed: float = 343.0,
+        target_fs: int | None = 16000,
+    ):
+        if mic_positions is None:
+            mic_positions = eigenmike_mic_positions(CFG_CROSS_EIGENMIKE_CHANNELS)
+        self.mic_positions = np.asarray(mic_positions, dtype=np.float64)
+        self.frame_seconds = float(frame_ms) / 1000.0
+        self.hop_seconds = float(hop_ms) / 1000.0
+        self.n_azimuth = int(n_azimuth)
+        self.sound_speed = float(sound_speed)
+        self.target_fs = int(target_fs) if target_fs else None
+
+    def __call__(self, wav, fs):
+        x, fs, frame_len, hop_len, n_frames, n_fft = self._prepare(wav, fs)
+        C, T = x.shape
+        center = n_fft // 2
+        i_idx, j_idx = self._pairs(C)
+        n_pairs = i_idx.size
+
+        azimuths = np.linspace(-np.pi, np.pi, self.n_azimuth, endpoint=False, dtype=np.float64)
+        directions = np.stack(
+            [np.cos(azimuths), np.sin(azimuths), np.zeros_like(azimuths)], axis=-1,
+        )  # [A, 3]
+
+        delta = self.mic_positions[j_idx] - self.mic_positions[i_idx]   # [P, 3]
+        # GCC peaks at lag = delta . u / c * fs (centered); evaluate cc at that lag.
+        tdoa_seconds = (delta @ directions.T) / self.sound_speed         # [P, A]
+        delay_samples = tdoa_seconds * fs + center                       # [P, A]
+        lag0 = np.floor(delay_samples).astype(np.int64)
+        w1 = (delay_samples - lag0).astype(np.float64)
+        w0 = 1.0 - w1
+        lag1 = np.clip(lag0 + 1, 0, n_fft - 1)
+        lag0 = np.clip(lag0, 0, n_fft - 1)
+        rows = np.arange(n_pairs)[:, None]
+
+        window = np.hanning(frame_len).astype(np.float64)
+        out = np.zeros(n_frames, dtype=np.float32)
+
+        for k in range(n_frames):
+            start = k * hop_len
+            if start + frame_len <= T:
+                frame = x[:, start:start + frame_len] * window
+            else:
+                frame = np.zeros((C, frame_len), dtype=np.float64)
+                tail = max(0, T - start)
+                if tail > 0:
+                    frame[:, :tail] = x[:, start:start + tail]
+                frame *= window
+
+            cc = self._phat_cc(frame, n_fft, i_idx, j_idx)              # [P, n_fft]
             scores = (w0 * cc[rows, lag0] + w1 * cc[rows, lag1]).sum(axis=0)  # [A]
             out[k] = float(azimuths[int(np.argmax(scores))])
 
         return out, self.hop_seconds
+
+
+# Backward-compatible alias: external scripts importing GCCPHATBaseline still work.
+GCCPHATBaseline = SRPPHATBaseline
 
 
 class DOAMambaModel(LocalizationAlgorithm):
@@ -396,6 +529,23 @@ def _evaluate_recording(
     plots_dir: Path | None = None,
 ) -> _RecordingResult | None:
     wav, fs, title, _ = load_locata_waveform(root, split, task, recording, array, channels)
+
+    # Consistency checks between wav payload and algorithm expectations.
+    if wav.ndim != 2:
+        raise ValueError(f"{title}: expected wav [C, T], got shape {tuple(wav.shape)}")
+    C_wav, T_wav = wav.shape
+    if C_wav != len(channels):
+        raise ValueError(
+            f"{title}: load_locata_waveform returned {C_wav} channels but "
+            f"--channels has {len(channels)} entries: {list(channels)}"
+        )
+    if not (8000 <= int(fs) <= 192000):
+        raise ValueError(f"{title}: implausible sample rate {fs} Hz")
+    if T_wav <= 0:
+        raise ValueError(f"{title}: empty waveform")
+    # Sync geometry-aware baselines to the actually-loaded channel subset.
+    algorithm.set_channels(channels)
+
     estimate, _hop_seconds = algorithm(wav, fs)
     estimate = np.asarray(estimate, dtype=np.float64).reshape(-1)
     n_frames = int(estimate.shape[0])
@@ -427,18 +577,30 @@ def _evaluate_recording(
             float("nan"), 0,
         )
 
+    # Metrics convention:
+    #   acc@10°, acc@15°  — fraction of VAD-active frames within threshold (coverage)
+    #   MAE, RMSE         — computed on *inliers only* (err < 15°), so catastrophic
+    #                       wrong-peak / front-back frames don't drag the localization-
+    #                       precision number into orbit. n_inlier15 carries the count
+    #                       so a small inlier MAE isn't read without context.
     err = _angular_error_deg(estimate, labels.astype(np.float64))[valid]
-    inlier15 = err <= 15.0
+    inlier15 = err < 15.0
     n_inlier15 = int(inlier15.sum())
-    mae_inlier15_deg = float(err[inlier15].mean()) if n_inlier15 > 0 else float("nan")
+    if n_inlier15 > 0:
+        err_in = err[inlier15]
+        mae_deg = float(err_in.mean())
+        rmse_deg = float(np.sqrt((err_in ** 2).mean()))
+    else:
+        mae_deg = float("nan")
+        rmse_deg = float("nan")
     return _RecordingResult(
         task=task, recording=recording, array=array, group=group,
         n_frames=n_frames, n_valid=int(valid.sum()),
-        mae_deg=float(err.mean()),
-        rmse_deg=float(np.sqrt((err ** 2).mean())),
+        mae_deg=mae_deg,
+        rmse_deg=rmse_deg,
         acc_at_10=float((err <= 10.0).mean()),
         acc_at_15=float((err <= 15.0).mean()),
-        mae_inlier15_deg=mae_inlier15_deg,
+        mae_inlier15_deg=mae_deg,            # kept as alias for back-compat with CSV reader
         n_inlier15=n_inlier15,
     )
 
@@ -602,36 +764,41 @@ def _aggregate(results: list[_RecordingResult]) -> dict[str, dict[str, float]]:
     for group, items in groups.items():
         if not items:
             continue
-        weights = np.array([r.n_valid for r in items], dtype=np.float64)
+        # acc weights = VAD-active frames (denominator of acc@k).
+        # MAE / RMSE weights = inlier frames, since per-recording MAE / RMSE are
+        # already computed on err < 15° only.
+        valid_w = np.array([r.n_valid for r in items], dtype=np.float64)
+        inlier_w = np.array([r.n_inlier15 for r in items], dtype=np.float64)
         mae = np.array([r.mae_deg for r in items], dtype=np.float64)
         rmse = np.array([r.rmse_deg for r in items], dtype=np.float64)
         acc10 = np.array([r.acc_at_10 for r in items], dtype=np.float64)
         acc15 = np.array([r.acc_at_15 for r in items], dtype=np.float64)
-        inlier_weights = np.array([r.n_inlier15 for r in items], dtype=np.float64)
-        mae_inlier15 = np.array([r.mae_inlier15_deg for r in items], dtype=np.float64)
-        mask = (weights > 0) & np.isfinite(mae)
-        if not mask.any():
+
+        acc_mask = valid_w > 0
+        if not acc_mask.any():
             continue
-        w = weights[mask]
-        # Inlier aggregate: weight by per-recording inlier counts so groups with
-        # few inliers don't dominate; NaN-safe when no recordings have any inliers.
-        inlier_mask = mask & (inlier_weights > 0) & np.isfinite(mae_inlier15)
-        if inlier_mask.any():
-            iw = inlier_weights[inlier_mask]
-            mae_inlier15_group = float((mae_inlier15[inlier_mask] * iw).sum() / iw.sum())
-            n_inlier15_group = int(iw.sum())
+        wa = valid_w[acc_mask]
+
+        in_mask = (inlier_w > 0) & np.isfinite(mae)
+        if in_mask.any():
+            wi = inlier_w[in_mask]
+            mae_group = float((mae[in_mask] * wi).sum() / wi.sum())
+            rmse_group = float(np.sqrt((rmse[in_mask] ** 2 * wi).sum() / wi.sum()))
+            n_inlier_group = int(wi.sum())
         else:
-            mae_inlier15_group = float("nan")
-            n_inlier15_group = 0
+            mae_group = float("nan")
+            rmse_group = float("nan")
+            n_inlier_group = 0
+
         out[group] = {
-            "n_recordings": int(mask.sum()),
-            "n_frames": int(w.sum()),
-            "mae_deg": float((mae[mask] * w).sum() / w.sum()),
-            "rmse_deg": float(np.sqrt((rmse[mask] ** 2 * w).sum() / w.sum())),
-            "acc_at_10": float((acc10[mask] * w).sum() / w.sum()),
-            "acc_at_15": float((acc15[mask] * w).sum() / w.sum()),
-            "mae_inlier15_deg": mae_inlier15_group,
-            "n_inlier15": n_inlier15_group,
+            "n_recordings": int(acc_mask.sum()),
+            "n_frames": int(wa.sum()),
+            "mae_deg": mae_group,
+            "rmse_deg": rmse_group,
+            "acc_at_10": float((acc10[acc_mask] * wa).sum() / wa.sum()),
+            "acc_at_15": float((acc15[acc_mask] * wa).sum() / wa.sum()),
+            "mae_inlier15_deg": mae_group,    # alias retained for back-compat readers
+            "n_inlier15": n_inlier_group,
         }
     return out
 
@@ -742,7 +909,10 @@ def main() -> None:
     p.add_argument("--checkpoint", default=None,
                    help="DOAMAMBA checkpoint .ckpt path. Defaults to cfg.resume_from_checkpoint.")
     p.add_argument("--array", default="eigenmike",
-                   choices=("eigenmike", "dicit", "benchmark2", "dummy"))
+                   choices=tuple(DEFAULT_ARRAY_CHANNELS.keys()),
+                   help="Physical or virtual array preset. 'eigenmike_cfg_cross' "
+                        "reads the 'eigenmike' directory but slices the 5 capsules "
+                        "(28, 22, 0, 26, 18) that match cfg.receivers_coords.")
     p.add_argument("--channels", default=None,
                    help="Comma-separated 0-indexed channels (default: per-array preset).")
     p.add_argument("--split", default="dev", choices=("dev", "eval"))
@@ -799,7 +969,9 @@ def main() -> None:
 
     algo = _import_algorithm(args.algo)
     label = getattr(algo, "name", args.algo)
-    print(f"algorithm={label}  array={args.array}  channels={channels}  split={args.split}")
+    physical_array = _PHYSICAL_ARRAY.get(args.array, args.array)
+    print(f"algorithm={label}  array={args.array} (physical={physical_array})  "
+          f"channels={channels}  split={args.split}")
     print(f"tasks={tasks}  static={STATIC_TASKS}  moving={MOVING_TASKS}")
 
     plots_dir = Path(args.plots_dir) if args.plots_dir else Path(args.out) / "plots"
@@ -807,12 +979,12 @@ def main() -> None:
     print(f"[locata] per-recording PNGs -> {plots_dir}")
 
     results: list[_RecordingResult] = []
-    for task, rec in _iter_recordings(args.locata_root, args.split, tasks, args.array):
+    for task, rec in _iter_recordings(args.locata_root, args.split, tasks, physical_array):
         group = _group_for_task(task)
         try:
             r = _evaluate_recording(
-                algo, args.locata_root, args.split, task, rec, args.array, channels, group,
-                plots_dir=plots_dir,
+                algo, args.locata_root, args.split, task, rec, physical_array,
+                channels, group, plots_dir=plots_dir,
             )
         except Exception as exc:  # one bad recording shouldn't kill the run
             print(f"  task{task} rec{rec}: SKIP ({exc})", file=sys.stderr)
@@ -820,13 +992,11 @@ def main() -> None:
         if r is None:
             continue
         results.append(r)
-        mae15_str = (
-            f"{r.mae_inlier15_deg:5.2f}°" if r.n_inlier15 > 0 else "  n/a"
-        )
+        mae_str = f"{r.mae_deg:5.2f}°" if r.n_inlier15 > 0 else "  n/a"
+        rmse_str = f"{r.rmse_deg:5.2f}°" if r.n_inlier15 > 0 else "  n/a"
         print(
             f"  task{task} rec{rec} [{group:>6s}]: "
-            f"MAE={r.mae_deg:6.2f}°  RMSE={r.rmse_deg:6.2f}°  "
-            f"MAE@15={mae15_str} ({r.n_inlier15}/{r.n_valid})  "
+            f"MAE={mae_str}  RMSE={rmse_str}  (inliers {r.n_inlier15}/{r.n_valid})  "
             f"acc@10={100 * r.acc_at_10:5.1f}%  acc@15={100 * r.acc_at_15:5.1f}%  "
             f"({r.n_valid}/{r.n_frames} frames)"
         )
@@ -847,12 +1017,11 @@ def main() -> None:
         if group not in aggregates:
             continue
         a = aggregates[group]
-        mae15_str = (
-            f"{a['mae_inlier15_deg']:5.2f}°" if a["n_inlier15"] > 0 else "  n/a"
-        )
+        mae_str = f"{a['mae_deg']:5.2f}°" if a["n_inlier15"] > 0 else "  n/a"
+        rmse_str = f"{a['rmse_deg']:5.2f}°" if a["n_inlier15"] > 0 else "  n/a"
         print(
-            f"  {group:>6s}: MAE={a['mae_deg']:6.2f}°  RMSE={a['rmse_deg']:6.2f}°  "
-            f"MAE@15={mae15_str} ({a['n_inlier15']} inliers)  "
+            f"  {group:>6s}: MAE={mae_str}  RMSE={rmse_str}  "
+            f"({a['n_inlier15']} inliers)  "
             f"acc@10={100 * a['acc_at_10']:5.1f}%  acc@15={100 * a['acc_at_15']:5.1f}%  "
             f"({a['n_recordings']} recs, {a['n_frames']} frames)"
         )

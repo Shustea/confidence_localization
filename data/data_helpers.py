@@ -74,16 +74,19 @@ def _sample_source_position(args, room_dim, mic_centroid):
         dist = float(np.random.uniform(1.5, 2.15))
         height = float(np.random.uniform(1.65, 1.85))
     else:
-        margin = float(rr.source_radius_margin)
+        wall_margin = float(rr.source_radius_margin)
+        # Decouple "min source-to-array distance" (far-field) from "source-to-wall margin".
+        # source_min_dist is optional; falls back to wall_margin for legacy configs.
+        min_dist = float(getattr(rr, "source_min_dist", wall_margin))
         max_radius = min(
-            mic_centroid[0] - margin,
-            mic_centroid[1] - margin,
-            room_dim[0] - mic_centroid[0] - margin,
-            room_dim[1] - mic_centroid[1] - margin,
+            mic_centroid[0] - wall_margin,
+            mic_centroid[1] - wall_margin,
+            room_dim[0] - mic_centroid[0] - wall_margin,
+            room_dim[1] - mic_centroid[1] - wall_margin,
         )
-        max_radius = max(margin + 0.1, max_radius)
+        max_radius = max(min_dist + 0.1, max_radius)
         doa = float(np.random.uniform(0, 2 * np.pi))
-        dist = float(np.random.uniform(margin, max_radius))
+        dist = float(np.random.uniform(min_dist, max_radius))
         height = float(np.random.uniform(*rr.source_height_range))
 
     start_pos = np.array([

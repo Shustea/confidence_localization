@@ -195,3 +195,10 @@ cython_debug/
 data/sph2pipe.exe
 
 *.png
+/data/lab/
+models/*.ckpt
+/.claude/
+/=
+/a.out
+/extracting
+/sha256:*

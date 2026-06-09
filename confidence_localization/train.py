@@ -308,6 +308,9 @@ class DOAMAMBA(pl.LightningModule):
                 spectrum=spectrum[1].cpu(),
                 waveform=example_wav,
                 fs=int(self.cfg.fs),
+                mic_positions=self.cfg.receivers_coords,
+                source_radius=getattr(self.cfg, "source_radius", 1.825),
+                room_dim=self.cfg.room_dim,
             )
             save_room_geometry(
                 labels=labels[1].cpu(),

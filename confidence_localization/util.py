@@ -16,14 +16,20 @@ def save_sample_as_image(
     path: str = '/workspaces/confidence_localization/samples/',
     waveform: torch.Tensor = None,
     fs: int = None,
+    mic_positions=None,
+    source_radius: float = None,
+    room_dim=None,
 ):
     """Save a publication-quality DOA evaluation figure.
 
-    Optional WAV panel (top): channel-0 waveform when ``waveform`` (and ``fs``)
-    are supplied. Required panels: azimuth estimate with ±1σ confidence band
-    vs. ground truth; absolute angular error and predicted confidence bound.
-    Optional REIR slice (bottom): 1D REIR at the middle time frame, with one
-    line per channel, when ``spectrum`` has shape ``[C, T, Freq/Lag]``.
+    Optional scenario panel (top): top-down xy view of mic array + source
+    trajectory when ``mic_positions`` and ``source_radius`` are supplied (and
+    ``room_dim`` if you also want the room outline). Optional WAV panel:
+    channel-0 waveform when ``waveform`` (and ``fs``) are supplied. Required
+    panels: azimuth estimate with ±1σ confidence band vs. ground truth;
+    absolute angular error and predicted confidence bound. Optional REIR slice
+    (bottom): 1D REIR at the middle time frame, with one line per channel,
+    when ``spectrum`` has shape ``[C, T, Freq/Lag]``.
     """
     tensor = tensor.squeeze().detach().cpu().float()
     label = label.squeeze().detach().cpu().float()
@@ -88,8 +94,49 @@ def save_sample_as_image(
     has_reir = reir is not None
     has_wav = wav_np is not None
 
-    # Build panel layout: optional wav (top), required azimuth+error, optional REIR.
+    # Top-down scenario: mic array + interpolated source trajectory on xy plane.
+    scenario = None
+    if mic_positions is not None and source_radius is not None:
+        mic_arr = np.asarray(mic_positions, dtype=np.float64)
+        if mic_arr.ndim == 2 and mic_arr.shape[1] >= 2:
+            center_xy = mic_arr[:, :2].mean(axis=0)
+            labels_np = label.numpy().reshape(-1)
+            valid_mask = np.isfinite(labels_np)
+            n_valid = int(valid_mask.sum())
+            n_total = int(labels_np.shape[0])
+            traj_xy = start_xy = end_xy = None
+            if n_valid >= 2:
+                first_idx = int(np.argmax(valid_mask))
+                last_idx = int(n_total - 1 - np.argmax(valid_mask[::-1]))
+                az_unwrapped = np.unwrap(labels_np[first_idx:last_idx + 1])
+                az_full = np.full(n_total, np.nan, dtype=np.float64)
+                az_full[first_idx:last_idx + 1] = az_unwrapped
+                idx_v = np.where(np.isfinite(az_full))[0]
+                r = float(source_radius)
+                traj_xy = np.empty((idx_v.size, 2), dtype=np.float64)
+                traj_xy[:, 0] = center_xy[0] + r * np.cos(az_full[idx_v])
+                traj_xy[:, 1] = center_xy[1] + r * np.sin(az_full[idx_v])
+                start_xy = (float(traj_xy[0, 0]), float(traj_xy[0, 1]))
+                end_xy = (float(traj_xy[-1, 0]), float(traj_xy[-1, 1]))
+            scenario = {
+                'mic_xy': mic_arr[:, :2],
+                'center_xy': center_xy,
+                'traj_xy': traj_xy,
+                'start_xy': start_xy,
+                'end_xy': end_xy,
+                'n_valid': n_valid,
+                'n_total': n_total,
+                'source_radius': float(source_radius),
+                'start_az': float(labels_np[int(np.argmax(valid_mask))]) if n_valid >= 1 else None,
+                'end_az': float(labels_np[int(n_total - 1 - np.argmax(valid_mask[::-1]))]) if n_valid >= 1 else None,
+            }
+    has_scenario = scenario is not None
+
+    # Build panel layout: optional scenario (top), optional wav, required
+    # azimuth+error, optional REIR.
     height_ratios = []
+    if has_scenario:
+        height_ratios.append(4)            # square-ish for aspect='equal'
     if has_wav:
         height_ratios.append(2)
     height_ratios.extend([3, 2])           # azimuth, error
@@ -110,6 +157,57 @@ def save_sample_as_image(
 
         # Resolve panel index map.
         idx = 0
+        if has_scenario:
+            ax_scn = axes[idx]; idx += 1
+            mic_xy = scenario['mic_xy']
+            center_xy = scenario['center_xy']
+            traj_xy = scenario['traj_xy']
+            r = scenario['source_radius']
+            if room_dim is not None:
+                rd = np.asarray(room_dim, dtype=float).reshape(-1)
+                if rd.size >= 2:
+                    x1, y1 = float(rd[0]), float(rd[1])
+                    ax_scn.plot(
+                        [0, x1, x1, 0, 0], [0, 0, y1, y1, 0],
+                        lw=0.8, color='#888888', alpha=0.7, label='Room',
+                    )
+            theta_ref = np.linspace(0, 2 * np.pi, 256)
+            ax_scn.plot(
+                center_xy[0] + r * np.cos(theta_ref),
+                center_xy[1] + r * np.sin(theta_ref),
+                ls=':', color='#888888', lw=0.6, alpha=0.6,
+            )
+            if traj_xy is not None:
+                step = max(1, traj_xy.shape[0] // 600)
+                ax_scn.plot(
+                    traj_xy[::step, 0], traj_xy[::step, 1], '.',
+                    color=_BLUE, ms=3.0, alpha=0.6, label='Source trajectory',
+                )
+                ax_scn.scatter(
+                    *scenario['start_xy'], color='#D95319', s=70, zorder=5,
+                    edgecolors='k', linewidths=0.5,
+                    label=f"Start ({np.rad2deg(scenario['start_az']):.0f}°)",
+                )
+                ax_scn.scatter(
+                    *scenario['end_xy'], color='#EDB120', s=110, marker='*',
+                    zorder=5, edgecolors='k', linewidths=0.3,
+                    label=f"End ({np.rad2deg(scenario['end_az']):.0f}°)",
+                )
+            ax_scn.scatter(
+                mic_xy[:, 0], mic_xy[:, 1], color='#7E2F8E', s=80, marker='^',
+                zorder=5, edgecolors='k', linewidths=0.5, label='Mics',
+            )
+            ax_scn.set_xlabel('x (m)')
+            ax_scn.set_ylabel('y (m)')
+            ax_scn.set_aspect('equal', adjustable='box')
+            ax_scn.set_title(
+                f"Scenario (top-down)  —  {scenario['n_valid']}/{scenario['n_total']} frames valid",
+                pad=4,
+            )
+            ax_scn.legend(
+                loc='upper right', framealpha=0.9, edgecolor='#aaaaaa', fontsize=8,
+            )
+
         if has_wav:
             ax_wav = axes[idx]; idx += 1
             fs_safe = max(1, int(fs)) if fs else 16000
