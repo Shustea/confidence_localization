@@ -64,6 +64,31 @@ from confidence_localization_dataloader import _vad_from_waveform  # noqa: E402
 _SEED = 42
 
 
+def _safe_wipe_dir(target_dir: Path) -> None:
+    """Delete cache files in ``target_dir`` tolerant of NFS busy/.nfs* artifacts.
+
+    A plain shutil.rmtree dies with [Errno 16] Device or resource busy when an
+    orphaned reader (e.g. a stale train.py dataloader) still holds a deleted
+    .pt open and NFS has silly-renamed it to .nfsXXXX. Those files are harmless
+    to the rebuilt cache (the loader globs *.pt), so skip what we can't remove.
+    """
+    target_dir = Path(target_dir)
+    skipped = 0
+    for p in target_dir.iterdir():
+        if p.name.startswith(".nfs"):
+            skipped += 1
+            continue
+        try:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink()
+        except OSError:
+            skipped += 1
+    if skipped:
+        print(f"  ({skipped} busy/.nfs file(s) left in place — harmless)")
+
+
 def _cache_one(args):
     """Worker: cache a single (row, target_dir, index) into a .pt file.
 
@@ -266,7 +291,7 @@ def main():
         for split_name, _prefix, target_dir, _rows in splits:
             if target_dir.exists():
                 print(f"[{split_name}] wiping existing cache dir: {target_dir}")
-                shutil.rmtree(target_dir)
+                _safe_wipe_dir(target_dir)
 
     for split_name, prefix, target_dir, rows in splits:
         if not rows:

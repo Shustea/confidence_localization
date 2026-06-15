@@ -103,6 +103,10 @@ log_var_weight : 1
 # Tanh range of [-1, 1]. [-4, 1.5] -> sigma in ~[1deg, 256deg].
 log_std_min : -4.0
 log_std_max : 1.5
+# Output head over the full (freq_dim x d_model) per-frame REIR feature.
+# Replaces the old d_model->1 channel collapse. head_in = freq_dim * d_model.
+head_hidden : 256
+head_dropout : 0.1
 
 lr : 5e-4
 weight_decay: 1e-5

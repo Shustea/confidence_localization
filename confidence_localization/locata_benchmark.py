@@ -896,10 +896,95 @@ def _load_cfg_if_exists(path: str):
     return OmegaConf.load(cfg_path)
 
 
+# Data-root keys overlaid from the current repo config onto a discovered (frozen)
+# training config, so an old checkpoint's config still points at where data lives now.
+_OVERLAY_PATH_KEYS = ("locata_root", "locata_target", "realman_root", "realman_target")
+
+
+def _discover_run_config(checkpoint: str | None) -> Path | None:
+    """Find the training config that goes with ``checkpoint``.
+
+    Checkpoints live in ``<run>/models/*.ckpt``; the config is either a snapshot
+    co-located by train.py (``<run>/models/config.yaml``) or Hydra's frozen
+    ``<run>/.hydra/config.yaml``. Returns the first that exists, else None.
+    """
+    if not checkpoint:
+        return None
+    ckpt = Path(checkpoint)
+    for c in (
+        ckpt.parent / "config.yaml",                         # snapshot next to the ckpts
+        ckpt.parent.parent / ".hydra" / "config.yaml",       # models/ is under the run dir
+        ckpt.parent / ".hydra" / "config.yaml",
+    ):
+        if c.is_file():
+            return c
+    return None
+
+
+def _resolve_benchmark_config(
+    checkpoint: str | None,
+    explicit: str | None,
+    out_dir: str,
+    rtf_noise_mode: str | None = None,
+) -> str:
+    """Pick the config to run with: explicit > auto-discovered > repo default.
+
+    The discovered (frozen) config is authoritative for architecture (e.g.
+    hidden_dim) so the checkpoint loads without shape mismatch. Current data
+    roots are overlaid from the repo config so the data is still found. If
+    ``rtf_noise_mode`` is given it overrides the front-end mode (use ``energy``
+    on real LOCATA/RealMAN so the full clip is kept — prefix mode drops the
+    first pre_speech_noise_time seconds and misaligns the labels). The final
+    config is written to ``<out>/config.resolved.yaml`` for reproducibility.
+    """
+    from omegaconf import OmegaConf
+    discovered = _discover_run_config(checkpoint) if not explicit else None
+    if explicit:
+        base = OmegaConf.load(explicit)
+    elif discovered is not None:
+        base = OmegaConf.load(discovered)
+        repo = _load_cfg_if_exists(_DEFAULT_CONFIG)
+        if repo is not None:
+            for k in _OVERLAY_PATH_KEYS:
+                if k in repo:
+                    base[k] = repo[k]
+    else:
+        base = _load_cfg_if_exists(_DEFAULT_CONFIG)
+        if base is None:
+            return _DEFAULT_CONFIG
+
+    # No derivation needed → return the original path untouched.
+    if explicit and rtf_noise_mode is None:
+        return explicit
+    if discovered is None and not explicit and rtf_noise_mode is None:
+        return _DEFAULT_CONFIG
+
+    if rtf_noise_mode is not None:
+        base["rtf_noise_mode"] = rtf_noise_mode
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    merged = out / "config.resolved.yaml"
+    OmegaConf.save(base, merged)
+    src = explicit or discovered or _DEFAULT_CONFIG
+    extra = f", rtf_noise_mode={rtf_noise_mode}" if rtf_noise_mode else ""
+    print(f"[locata] resolved config: {src}  (+ current data roots{extra})  -> {merged}")
+    return str(merged)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="LOCATA benchmark for DOA algorithms.")
-    p.add_argument("--config", default=_DEFAULT_CONFIG,
-                   help=f"Project config.yaml. Defaults to {_DEFAULT_CONFIG}.")
+    p.add_argument("--config", default=None,
+                   help="Project config.yaml. If omitted and --checkpoint is given, "
+                        "it is auto-discovered from the checkpoint's run dir "
+                        "(<run>/models/config.yaml or <run>/.hydra/config.yaml) with "
+                        f"current data roots overlaid. Falls back to {_DEFAULT_CONFIG}.")
+    p.add_argument("--rtf-noise-mode", default="energy", choices=("energy", "prefix"),
+                   help="Front-end noise estimation for the DOAMAMBA model. Default "
+                        "'energy' keeps the FULL clip (correct for real LOCATA/RealMAN "
+                        "and time-aligned with labels + the GCC/SRP baselines). 'prefix' "
+                        "drops the first pre_speech_noise_time seconds (synthetic only — "
+                        "misaligns labels on real recordings).")
     p.add_argument("--locata-root", default=None,
                    help="Path to LOCATA raw root (parent of dev/ or LOCATA/dev/). "
                         "Defaults to cfg.locata_root.")
@@ -925,6 +1010,12 @@ def main() -> None:
                    help="Directory for per-recording PNGs (default: <out>/plots).")
     args = p.parse_args()
 
+    # Resolve the config: explicit --config > auto-discovered-from-checkpoint >
+    # repo default. Architecture/front-end come from the run's frozen config so
+    # the checkpoint loads cleanly; current data roots are overlaid.
+    args.config = _resolve_benchmark_config(
+        args.checkpoint, args.config, args.out, rtf_noise_mode=args.rtf_noise_mode
+    )
     cfg = _load_cfg_if_exists(args.config)
 
     # Resolve --locata-root from cfg if unset.

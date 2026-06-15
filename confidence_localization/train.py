@@ -137,42 +137,50 @@ class DOAMAMBA(pl.LightningModule):
             *[MambaResCTF(cfg, expand) for expand in cfg.layers]
         )
 
-        self.hidden = nn.Linear(cfg.d_model, 1)
+        # Per-frame readout over the FULL (lag x channel) REIR feature. Replaces
+        # the old d_model->1 collapse, which discarded 3/4 of the cross-channel
+        # spatial information with a single fixed 4-weight projection. Azimuth is
+        # encoded in the lag pattern across the M-1 relative channels, so the head
+        # consumes all of it: [B, T, freq_dim * d_model] -> MLP -> (doa, log_std).
+        head_in = int(cfg.freq_dim) * int(cfg.d_model)
+        head_hidden = int(getattr(cfg, "head_hidden", 256))
+        self.head = nn.Sequential(
+            nn.Linear(head_in, head_hidden),
+            nn.GELU(),
+            nn.Dropout(float(getattr(cfg, "head_dropout", 0.1))),
+        )
 
         self.doa = nn.Sequential(
-            nn.Linear(cfg.input_dim, 2), nn.Tanh()  # output in [-1, 1]
+            nn.Linear(head_hidden, 2), nn.Tanh()  # output in [-1, 1]
         )
 
         # Raw linear head; the bounded mapping to [log_std_min, log_std_max] is
         # applied in forward(). Wider than the old Tanh's fixed [-1, 1] so the
         # model can express genuine high confidence (small sigma) once the head
         # is supervised. sigma = exp(log_std).
-        self.log_std = nn.Linear(cfg.input_dim, 1)
+        self.log_std = nn.Linear(head_hidden, 1)
         self.log_std_min = float(getattr(cfg, "log_std_min", -4.0))   # sigma ~ 1.0 deg
         self.log_std_max = float(getattr(cfg, "log_std_max", 1.5))    # sigma ~ 256 deg
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        init.xavier_uniform_(self.hidden.weight)
-        init.zeros_(self.hidden.bias)
-
-        # init.xavier_uniform_(self.doa.weight)
-        # init.zeros_(self.doa.bias)
-
-        # init.xavier_uniform_(self.log_std.weight)
-        # init.zeros_(self.log_std.bias)
+        init.xavier_uniform_(self.head[0].weight)
+        init.zeros_(self.head[0].bias)
 
     def forward(self, x):
-        x = x.permute(0, -1, 2, 1).contiguous()
+        x = x.permute(0, -1, 2, 1).contiguous()        # [B, freq, T, d]
 
         for block in self.mamba_layers:
             x = block(F.normalize(x, dim=-1))
 
-        x_hat = F.gelu(self.hidden(F.normalize(x, dim=-1)).squeeze(-1)).permute(0, 2, 1)
-        doa_vec = self.doa(x_hat)
+        B, Fq, T, d = x.shape
+        # [B, freq, T, d] -> [B, T, freq*d]: full per-frame lag x channel feature.
+        h = F.normalize(x, dim=-1).permute(0, 2, 1, 3).reshape(B, T, Fq * d)
+        h = self.head(h)
+        doa_vec = self.doa(h)
         # Map raw log_std linearly through tanh into [log_std_min, log_std_max].
-        raw = self.log_std(x_hat)
+        raw = self.log_std(h)
         log_std = self.log_std_min + (self.log_std_max - self.log_std_min) * 0.5 * (
             1.0 + torch.tanh(raw)
         )
@@ -424,6 +432,13 @@ class DOAMAMBA(pl.LightningModule):
 
 @hydra.main(config_path="..", config_name="config", version_base="1.1")
 def main(cfg):
+
+    # Snapshot the resolved config next to the checkpoints (./models/ under the
+    # Hydra run dir) so the LOCATA benchmark can reconstruct this exact model
+    # from just the checkpoint path. See locata_benchmark._discover_run_config.
+    from omegaconf import OmegaConf
+    os.makedirs("./models", exist_ok=True)
+    OmegaConf.save(cfg, "./models/config.yaml")
 
     # our_transform = transforms.Normalize(mean=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2], std=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2])
     train_loader = cld.get_dataloader(cfg, stage="train", shuffle=True)
