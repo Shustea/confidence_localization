@@ -284,50 +284,51 @@ def main():
             channels = [0, 3, 5, 7, 1]
     use_noisy = True
 
-    # Always need VAL and TEST metadata.
-    print(f"loading RealMAN metadata: split=val mode={args.mode}")
-    val_frame = load_realman_metadata(realman_root, "val", args.mode)
-    val_rows = val_frame.to_dict("records")
-    print(f"  VAL  partition: {len(val_rows)} rows")
-
-    print(f"loading RealMAN metadata: split=test mode={args.mode}")
-    test_frame = load_realman_metadata(realman_root, "test", args.mode)
-    test_rows = test_frame.to_dict("records")
-    print(f"  TEST partition: {len(test_rows)} rows")
-
+    # Only load the metadata CSVs for the splits actually requested, so a
+    # train-only rebuild works even after the raw val/test dirs (and their CSVs)
+    # have been deleted to free disk.
+    requested = {s.strip() for s in args.splits.split(",") if s.strip()}
     rng = np.random.default_rng(_SEED)
+    train_rows, valh_rows, test_rows = [], [], []
+    train_prefix = "TRAIN_M" if args.use_real_train else "VAL_M"
+
     if args.use_real_train:
-        # Read the actual train CSV; train_rows come from train partition,
-        # val_rows used in full (no 80/20 split).
-        print(f"loading RealMAN metadata: split=train mode={args.mode}")
-        train_frame = load_realman_metadata(realman_root, "train", args.mode)
-        train_pool = train_frame.to_dict("records")
-        print(f"  TRAIN partition: {len(train_pool)} rows")
-        # Keep only rows for the scene archives actually downloaded.
-        if args.scenes:
-            scene_names = [s.strip() for s in args.scenes.split(",") if s.strip()]
-            def _row_scene_ok(row):
-                fn = str(row.get("filename", ""))
-                return any(f"/{s}/" in fn or f"/{s}." in fn for s in scene_names)
-            before = len(train_pool)
-            train_pool = [r for r in train_pool if _row_scene_ok(r)]
-            print(f"  scene filter {scene_names}: {len(train_pool)}/{before} rows kept")
-        # Shuffle deterministically so a capped subset is representative.
-        perm = rng.permutation(len(train_pool))
-        train_rows = [train_pool[i] for i in perm]
-        if args.max_train is not None:
-            train_rows = train_rows[: int(args.max_train)]
-        valh_rows = val_rows                              # full VAL → val
-        train_prefix = "TRAIN_M"
+        if "train" in requested:
+            print(f"loading RealMAN metadata: split=train mode={args.mode}")
+            train_pool = load_realman_metadata(realman_root, "train", args.mode).to_dict("records")
+            print(f"  TRAIN partition: {len(train_pool)} rows")
+            if args.scenes:
+                scene_names = [s.strip() for s in args.scenes.split(",") if s.strip()]
+                def _row_scene_ok(row):
+                    fn = str(row.get("filename", ""))
+                    return any(f"/{s}/" in fn or f"/{s}." in fn for s in scene_names)
+                before = len(train_pool)
+                train_pool = [r for r in train_pool if _row_scene_ok(r)]
+                print(f"  scene filter {scene_names}: {len(train_pool)}/{before} rows kept")
+            perm = rng.permutation(len(train_pool))
+            train_rows = [train_pool[i] for i in perm]
+            if args.max_train is not None:
+                train_rows = train_rows[: int(args.max_train)]
+        if "val" in requested:
+            print(f"loading RealMAN metadata: split=val mode={args.mode}")
+            valh_rows = load_realman_metadata(realman_root, "val", args.mode).to_dict("records")
+            print(f"  VAL partition: {len(valh_rows)} rows")
+        if "eval" in requested:
+            print(f"loading RealMAN metadata: split=test mode={args.mode}")
+            test_rows = load_realman_metadata(realman_root, "test", args.mode).to_dict("records")
+            print(f"  TEST partition: {len(test_rows)} rows")
     else:
-        # Default: deterministic 80/20 split of VAL into train/val.
-        perm = rng.permutation(len(val_rows))
-        n_val = int(round(args.val_fraction * len(val_rows)))
-        train_idx = perm[n_val:]
-        val_idx = perm[:n_val]
-        train_rows = [val_rows[i] for i in train_idx]
-        valh_rows = [val_rows[i] for i in val_idx]
-        train_prefix = "VAL_M"
+        # Default: deterministic 80/20 split of the VAL partition into train/val.
+        if {"train", "val"} & requested:
+            val_pool = load_realman_metadata(realman_root, "val", args.mode).to_dict("records")
+            print(f"  VAL partition: {len(val_pool)} rows")
+            perm = rng.permutation(len(val_pool))
+            n_val = int(round(args.val_fraction * len(val_pool)))
+            train_rows = [val_pool[i] for i in perm[n_val:]]
+            valh_rows = [val_pool[i] for i in perm[:n_val]]
+        if "eval" in requested:
+            test_rows = load_realman_metadata(realman_root, "test", args.mode).to_dict("records")
+            print(f"  TEST partition: {len(test_rows)} rows")
 
     # Per-split caps (applied before the global --max-per-split cap).
     if args.max_train is not None and not args.use_real_train:
@@ -362,7 +363,6 @@ def main():
             print(f"[noise-aug] {len(noise_pool)} noise recordings, "
                   f"snr_levels={snr_levels} -> train x{len(snr_levels)}")
 
-    requested = {s.strip() for s in args.splits.split(",") if s.strip()}
     splits = [
         ("train", train_prefix, realman_target / "train", train_rows),
         ("val",   "VAL_M",      realman_target / "val",   valh_rows),
