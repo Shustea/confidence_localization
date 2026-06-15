@@ -89,13 +89,61 @@ def _safe_wipe_dir(target_dir: Path) -> None:
         print(f"  ({skipped} busy/.nfs file(s) left in place — harmless)")
 
 
-def _cache_one(args):
-    """Worker: cache a single (row, target_dir, index) into a .pt file.
+def scan_noise_pool(root: str) -> list[str]:
+    """Return base paths (sans _CH{n}.flac) of every extracted ma_noise recording."""
+    base = Path(root) / "train" / "ma_noise"
+    bases: list[str] = []
+    if base.exists():
+        for ch0 in sorted(base.rglob("*_CH0.flac")):
+            bases.append(str(ch0)[: -len("_CH0.flac")])
+    return bases
 
-    Returns (saved: bool, title: str, err: str | None). Errors are swallowed so a
+
+def _load_noise(base: str, channels, target_fs: int):
+    """Load a multichannel noise recording [C, T] (cfg-order channels), resampled."""
+    import soundfile as sf
+    waves, sr = [], None
+    for ch in channels:
+        audio, fs = sf.read(f"{base}_CH{ch}.flac", dtype="float32", always_2d=True)
+        waves.append(torch.from_numpy(audio[:, 0]))
+        sr = fs if sr is None else sr
+    n = min(int(w.numel()) for w in waves)
+    noise = torch.stack([w[:n] for w in waves], dim=0)
+    if int(sr) != int(target_fs):
+        import torchaudio.functional as taF
+        noise = taF.resample(noise, int(sr), int(target_fs))
+    return noise
+
+
+def _mix_at_snr(speech, noise, snr_db: float, rng):
+    """Mix speech [C,T] + noise [C,*] at speech-to-noise ratio snr_db (broadband).
+
+    Noise is tiled if shorter than the speech, random-cropped if longer.
+    """
+    C, T = speech.shape
+    nt = int(noise.shape[1])
+    if nt < T:
+        reps = (T + nt - 1) // nt
+        noise = noise.repeat(1, reps)[:, :T]
+    elif nt > T:
+        start = int(rng.integers(0, nt - T + 1))
+        noise = noise[:, start:start + T]
+    sp = float((speech ** 2).mean()) + 1e-12
+    npow = float((noise ** 2).mean()) + 1e-12
+    scale = (sp / (npow * (10.0 ** (snr_db / 10.0)))) ** 0.5
+    return speech + scale * noise
+
+
+def _cache_one(args):
+    """Worker: cache one (row, snr) sample into a .pt file.
+
+    If ``noise_pool`` and ``snr`` are given, a random noise recording is mixed
+    into the speech at the target SNR before the RTF is computed (waveform-level
+    augmentation; the source DOA labels are unchanged). Errors are swallowed so a
     single bad recording doesn't kill the run.
     """
-    cfg, root, row, channels, use_noisy, target_dir, index, overwrite, title_prefix = args
+    (cfg, root, row, channels, use_noisy, target_dir, index, overwrite,
+     title_prefix, noise_pool, snr) = args
     try:
         wav, sample_rate, base_title = load_realman_waveform(
             root, row, channels, use_noisy=use_noisy,
@@ -108,18 +156,29 @@ def _cache_one(args):
             import torchaudio.functional as taF
             wav = taF.resample(wav, int(sample_rate), target_fs)
             sample_rate = target_fs
+
+        title_suffix = ""
+        if noise_pool and snr is not None:
+            # Seed per (recording, snr) for reproducible noise selection.
+            rng = np.random.default_rng(abs(hash((base_title, float(snr)))) % (2**32))
+            nb = noise_pool[int(rng.integers(0, len(noise_pool)))]
+            noise = _load_noise(nb, channels, target_fs)
+            wav = _mix_at_snr(wav, noise, float(snr), rng)
+            title_suffix = f"__snr{int(round(float(snr))):+d}"
+
         rtf = preprocess_waveform(
             cfg, wav, sample_rate=int(sample_rate), normalize=False,
         )
         rtf = normalize_rtf(rtf)
         labels = build_realman_labels(row, rtf.shape[1])
         vad = _vad_from_waveform(cfg, wav, int(sample_rate), rtf.shape[1])
-        title = f"{title_prefix}_{base_title}"
+        title = f"{title_prefix}_{base_title}{title_suffix}"
         out_path = cache_file_path(str(target_dir), index, title)
         saved = save_cached_sample(
             out_path, rtf, labels, title,
             meta={"source": "realman", "split_prefix": title_prefix,
-                  "channels": list(channels)},
+                  "channels": list(channels),
+                  "snr_db": (float(snr) if snr is not None else None)},
             vad=vad, overwrite=overwrite,
         )
         return saved, title, None
@@ -128,15 +187,22 @@ def _cache_one(args):
 
 
 def _build_split(cfg, root, split_name, mode, channels, use_noisy,
-                 rows, target_dir, workers, overwrite, title_prefix):
+                 rows, target_dir, workers, overwrite, title_prefix,
+                 noise_pool=None, snr_levels=None):
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    jobs = [
-        (cfg, root, rows[i], channels, use_noisy, str(target_dir), i, overwrite, title_prefix)
-        for i in range(len(rows))
-    ]
-    print(f"[{split_name}] caching {len(jobs)} samples ({workers} workers) "
-          f"-> {target_dir}")
+    # Noise augmentation: emit one job per (recording, snr level). Without it,
+    # one clean job per recording (snr=None).
+    levels = snr_levels if (noise_pool and snr_levels) else [None]
+    jobs, idx = [], 0
+    for i in range(len(rows)):
+        for snr in levels:
+            jobs.append((cfg, root, rows[i], channels, use_noisy, str(target_dir),
+                         idx, overwrite, title_prefix, noise_pool, snr))
+            idx += 1
+    aug = f" x{len(levels)} snr levels {levels}" if levels != [None] else ""
+    print(f"[{split_name}] caching {len(jobs)} samples ({len(rows)} recs{aug}, "
+          f"{workers} workers) -> {target_dir}")
     n_saved = n_err = 0
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futures = [ex.submit(_cache_one, j) for j in jobs]
@@ -194,6 +260,12 @@ def main():
                    help="Noise-covariance estimation for the RTF front-end. Real "
                         "RealMAN recordings have no clean pre-speech segment, so "
                         "'energy' (lowest-energy frames) is the correct default.")
+    p.add_argument("--snr-levels", default=None,
+                   help="Comma-separated dB SNR levels for noise augmentation of the "
+                        "TRAIN split, e.g. '15,5,-5' -> 3 augmented copies per recording, "
+                        "each mixing a random ma_noise recording at that speech-to-noise "
+                        "ratio. Requires extracted train/ma_noise/. val/eval are never "
+                        "augmented (they use real ma_noisy_speech).")
     args = p.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -276,6 +348,20 @@ def main():
           f"val={len(valh_rows)}  eval={len(test_rows)}  "
           f"(train_prefix={train_prefix})")
 
+    # Noise augmentation (TRAIN split only): mix real ma_noise at each SNR level.
+    snr_levels = None
+    noise_pool = []
+    if args.snr_levels:
+        snr_levels = [float(x) for x in args.snr_levels.split(",") if x.strip()]
+        noise_pool = scan_noise_pool(realman_root)
+        if not noise_pool:
+            print("[noise-aug] WARNING: --snr-levels set but no extracted "
+                  "train/ma_noise/ recordings found; train will be cached CLEAN.")
+            snr_levels = None
+        else:
+            print(f"[noise-aug] {len(noise_pool)} noise recordings, "
+                  f"snr_levels={snr_levels} -> train x{len(snr_levels)}")
+
     requested = {s.strip() for s in args.splits.split(",") if s.strip()}
     splits = [
         ("train", train_prefix, realman_target / "train", train_rows),
@@ -297,6 +383,9 @@ def main():
         if not rows:
             print(f"[{split_name}] no rows, skipping.")
             continue
+        # Augment the train split only; val/eval use real ma_noisy_speech.
+        split_noise_pool = noise_pool if split_name == "train" else None
+        split_snr = snr_levels if split_name == "train" else None
         _build_split(
             cfg=cfg,
             root=realman_root,
@@ -309,6 +398,8 @@ def main():
             workers=args.workers,
             overwrite=args.overwrite,
             title_prefix=prefix,
+            noise_pool=split_noise_pool,
+            snr_levels=split_snr,
         )
 
     # Final summary.
