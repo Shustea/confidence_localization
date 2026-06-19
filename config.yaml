@@ -14,7 +14,7 @@ resume_from_checkpoint: False
 train_size : 5400
 val_size : 600
 
-batch_size: 8
+batch_size: 16
 num_workers: 8
 
 preprocessed_data_flag : True
@@ -90,6 +90,10 @@ rtf_noise_percentile: 0.15   # energy mode: fraction of lowest-energy frames use
 
 eps: 1e-6
 
+# Which architecture build_model() instantiates. One of:
+#   doamamba | gcc_mamba | gcc_med | gcc_kalman | rtf_mamba
+model_type : doamamba
+
 input_dim : 1024
 d_model : 4
 freq_dim : 1024
@@ -107,6 +111,28 @@ log_std_max : 1.5
 # Replaces the old d_model->1 channel collapse. head_in = freq_dim * d_model.
 head_hidden : 256
 head_dropout : 0.1
+
+# --- GCC / new-model knobs --------------------------------------------------
+# Framed GCC-PHAT front-end (gcc_phat_frames). n_lags is the cropped, centred
+# TDOA window in samples (odd); ±20 covers the RealMAN array's physical range.
+gcc:
+  n_lags : 41
+# gcc_mamba reuses the DOAMAMBA backbone with channel axis = mic pairs and freq
+# axis = n_lags. Override layers/n_lags here independently of the RTF model.
+gcc_mamba:
+  n_lags : 41
+  layers : [2, 4, 4, 4]
+# gcc_med / gcc_kalman: same model, smoothing the predicted DOA track at eval.
+gcc_med:
+  window : 5            # sliding-window median length (odd)
+gcc_kalman:
+  q : 1e-3             # constant-velocity process-noise scale
+  r : 5e-2             # azimuth measurement variance
+# rtf_mamba: peak-feature model over the cached REIR; Mamba in the last layer.
+rtf_mamba:
+  interp : parabolic   # parabolic | sinc  (sub-sample peak refinement)
+  sinc_os : 8          # sinc upsampling factor (interp=sinc only)
+  expand : 2
 
 lr : 5e-4
 weight_decay: 1e-5
@@ -134,6 +160,9 @@ realman_root: "/workspaces/confidence_localization/data/lab/data/raw/RealMAN"
 locata_root: "/workspaces/confidence_localization/data/lab/data/raw/locata"
 realman_target: "/workspaces/confidence_localization/data/lab/data/processed/RealMAN"
 locata_target: "/workspaces/confidence_localization/data/lab/data/processed/LOCATA"
+# Cropped GCC-PHAT cache (built by data/build_gcc_cache_splits.py) for the
+# gcc_* models. Same train/val/eval split layout as realman_target.
+realman_gcc_target: "/workspaces/confidence_localization/data/lab/data/processed/RealMAN_gcc"
 
 # Energy-based VAD config (used by the realtime RealMAN/LOCATA dataloader paths).
 # Omit / comment this whole block to disable VAD (datasets fall back to all-ones).
@@ -168,6 +197,10 @@ loader_per_source:
     batch_size: 1                       # single recording per dataset
     num_workers: 0
     pin_memory: true
+  gcc:
+    batch_size: ${batch_size}           # cached fixed-length GCC features stack fine
+    num_workers: ${num_workers}
+    pin_memory: true
 
 # Per-stage dataset dispatch. ``source`` selects the dataset; the matching sub-block
 # below it gives the dataset-specific settings (including its own target sample
@@ -175,7 +208,7 @@ loader_per_source:
 # pass ``data.train.loader.batch_size=1`` on the CLI when switching to realman.
 data:
   train:
-    source: realman                     # synthetic | realman | locata — only knob to flip
+    source: realman                     # synthetic | realman | locata | gcc — only knob to flip
     loader: ${loader_per_source.${data.train.source}}   # auto-tracks source
     synthetic:
       root: ${train_path}
@@ -190,6 +223,17 @@ data:
       feature_mode: cached              # realtime | cached
       cache_root: "${realman_target}/train"
       target_duration_sec: 8            # RealMAN default sample length (seconds)
+    gcc:                                # GCC-PHAT feature source for the gcc_* models
+      root: ${realman_root}
+      split: train
+      mode: moving
+      use_noisy: true
+      channels: [0, 3, 5, 7, 1]
+      every_nth: 1
+      max_items: null
+      feature_mode: cached              # realtime | cached
+      cache_root: "${realman_gcc_target}/train"
+      target_duration_sec: 8
     locata:
       root: ${locata_root}
       split: dev
@@ -217,6 +261,17 @@ data:
       feature_mode: cached
       cache_root: "${realman_target}/val"
       target_duration_sec: 8
+    gcc:
+      root: ${realman_root}
+      split: val
+      mode: moving
+      use_noisy: true
+      channels: [0, 3, 5, 7, 1]
+      every_nth: 1
+      max_items: null
+      feature_mode: cached
+      cache_root: "${realman_gcc_target}/val"
+      target_duration_sec: 8
     locata:
       root: ${locata_root}
       split: dev
@@ -241,6 +296,17 @@ data:
       max_items: null
       feature_mode: cached
       cache_root: "${realman_target}/eval"
+      target_duration_sec: 8
+    gcc:
+      root: ${realman_root}
+      split: test
+      mode: moving
+      use_noisy: true
+      channels: [0, 3, 5, 7, 1]
+      every_nth: 1
+      max_items: null
+      feature_mode: cached
+      cache_root: "${realman_gcc_target}/eval"
       target_duration_sec: 8
     locata:
       root: ${locata_root}

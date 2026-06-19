@@ -202,3 +202,8 @@ models/*.ckpt
 /a.out
 /extracting
 /sha256:*
+
+# scratch / benchmark outputs
+/runs/
+/tmp/
+/samples/

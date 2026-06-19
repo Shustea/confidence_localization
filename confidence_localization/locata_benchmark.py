@@ -403,7 +403,7 @@ class DOAMambaModel(LocalizationAlgorithm):
             sp = str(p)
             if sp not in sys.path:
                 sys.path.insert(0, sp)
-        from train import DOAMAMBA  # noqa: E402
+        from models import build_model  # noqa: E402
 
         cfg_path = config
         if not Path(cfg_path).is_absolute():
@@ -416,7 +416,7 @@ class DOAMambaModel(LocalizationAlgorithm):
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         state = torch.load(checkpoint, map_location=self.device)
-        self.model = DOAMAMBA(self.cfg)
+        self.model = build_model(self.cfg)
         self.model.load_state_dict(state["state_dict"], strict=False)
         self.model.eval().to(self.device)
 

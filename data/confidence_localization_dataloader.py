@@ -29,7 +29,7 @@ from eval_utils import (
     normalize_rtf,
     preprocess_waveform,
 )
-from util import energy_vad, vad_to_rtf_frames
+from util import energy_vad, gcc_phat_frames, vad_to_rtf_frames
 
 
 _g_factor_pattern = re.compile(r"-([-\d.]+)_[\d.-]+_[\d.-]+_")
@@ -261,6 +261,51 @@ class LOCATADataset(Dataset):
         return _apply_feature_pipeline(rtf, self.transform), labels, title, vad, wav_ch0
 
 
+class GccDataset(Dataset):
+    """Realtime GCC-PHAT over RealMAN wav: load wav, compute framed GCC-PHAT.
+
+    The cached counterpart is just a ``CachedExternalDataset`` pointed at the
+    GCC cache (built by ``data/build_gcc_cache_splits.py``), since the GCC
+    feature is stored under the same payload key as the RTF one.
+    """
+
+    def __init__(self, cfg, dataset_cfg, transform=None):
+        self.cfg = cfg
+        self.transform = transform
+        self.root = _cfg_get(dataset_cfg, "root", _cfg_get(cfg, "realman_root"))
+        self.split = _cfg_get(dataset_cfg, "split", "val")
+        self.mode = _cfg_get(dataset_cfg, "mode", "moving")
+        self.use_noisy = bool(_cfg_get(dataset_cfg, "use_noisy", True))
+        self.channels = list(
+            _cfg_get(dataset_cfg, "channels", _cfg_get(dataset_cfg, "chs", [0, 1]))
+        )
+        every_nth = _cfg_get(dataset_cfg, "every_nth", 1)
+        max_items = _cfg_get(dataset_cfg, "max_items", None)
+
+        frame = load_realman_metadata(self.root, self.split, self.mode)
+        self.rows = limit_records(frame.to_dict("records"), every_nth=every_nth, max_items=max_items)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        row = self.rows[idx]
+        wav, sample_rate, title = load_realman_waveform(
+            self.root, row, self.channels, use_noisy=self.use_noisy
+        )
+        wav = wav.float()
+        target_fs = int(self.cfg.fs)
+        if int(sample_rate) != target_fs:
+            import torchaudio.functional as taF
+            wav = taF.resample(wav, int(sample_rate), target_fs)
+            sample_rate = target_fs
+        gcc = gcc_phat_frames(wav, self.cfg)              # [P, T, n_lags]
+        labels = build_realman_labels(row, gcc.shape[1])
+        vad = _vad_from_waveform(self.cfg, wav, sample_rate, gcc.shape[1])
+        wav_ch0 = wav[0].float()
+        return _apply_feature_pipeline(gcc, self.transform), labels, title, vad, wav_ch0
+
+
 def assign_gt_to_tf_bin(cfg, spectrum_shape_tuple, path, classification):
     all_spectra = []
     _ = 0 if classification else 0
@@ -386,6 +431,19 @@ def _target_frames(cfg, dataset_cfg):
 
 
 def _external_dataset(cfg, stage_cfg, source, transform=None):
+    if source == "gcc":
+        dataset_cfg = _cfg_get(stage_cfg, "gcc", stage_cfg)
+        default_root = f"{_cfg_get(cfg, 'realman_gcc_target')}/train"
+        if _feature_mode(dataset_cfg) in {"cached", "cache", "precomputed"}:
+            return CachedExternalDataset(
+                _cfg_get(dataset_cfg, "cache_root", default_root),
+                transform=transform,
+                every_nth=_cfg_get(dataset_cfg, "every_nth", 1),
+                max_items=_cfg_get(dataset_cfg, "max_items", None),
+                target_frames=_target_frames(cfg, dataset_cfg),
+            )
+        return GccDataset(cfg, dataset_cfg, transform=transform)
+
     if source == "realman":
         dataset_cfg = _cfg_get(stage_cfg, "realman", stage_cfg)
         if _feature_mode(dataset_cfg) in {"cached", "cache", "precomputed"}:
@@ -420,7 +478,7 @@ def get_dataloader(cfg, root_dir=None, shuffle=False, transform=None, stage="tra
     stage_cfg = _stage_cfg(cfg, stage)
     source = str(_cfg_get(stage_cfg, "source", "synthetic")).lower()
 
-    if root_dir is None and source in {"realman", "locata"}:
+    if root_dir is None and source in {"realman", "locata", "gcc"}:
         dataset = _external_dataset(cfg, stage_cfg, source, transform=transform)
     else:
         dataset = CLDataset(cfg, _synthetic_root(cfg, stage_cfg, stage, root_dir), transform=transform)

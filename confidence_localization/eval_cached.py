@@ -27,7 +27,7 @@ for p in (_REPO, _REPO / "confidence_localization", _REPO / "data"):
         sys.path.insert(0, str(p))
 
 import confidence_localization_dataloader as cld  # noqa: E402
-from train import DOAMAMBA  # noqa: E402
+from models import build_model  # noqa: E402
 
 
 def main() -> None:
@@ -47,7 +47,7 @@ def main() -> None:
     OmegaConf.update(cfg, "loader_per_source.realman.num_workers", 4, force_add=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model = DOAMAMBA(cfg)
+    model = build_model(cfg)
     state = torch.load(args.checkpoint, map_location="cpu")
     sd = state.get("state_dict", state)
     missing, unexpected = model.load_state_dict(sd, strict=False)

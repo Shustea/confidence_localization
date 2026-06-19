@@ -1,14 +1,4 @@
-import pytorch_lightning as pl
 import torch
-from numpy import arange, unique
-from torch import nn
-import torch.nn.functional as F
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
-from model import *
-from train import DOAMAMBA
-from torchvision import transforms
-import matplotlib.pyplot as plt
 
 import hydra
 
@@ -19,7 +9,8 @@ sys.path.append(os.getcwd() + '/data')
 sys.path.append(os.getcwd() + '/confidence_localization')
 
 import confidence_localization_dataloader as cld
-from util import save_sample_as_image, save_doas
+from models import build_model
+from util import save_sample_as_image
 
         
 
@@ -28,7 +19,7 @@ def main(cfg):
     # our_transform = transforms.Normalize(mean=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2], std=[1/2, 1/2, 1/2, 1/2, 1/2, 1/2])
     val_loader = cld.get_dataloader(cfg, cfg.val_path)
 
-    model = DOAMAMBA(cfg)
+    model = build_model(cfg)
 
     device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
 

@@ -604,6 +604,168 @@ def compute_multichannel_stft(signal: np.ndarray, cfg):
     stft_tensor = torch.stack(stft_list, dim=0)
     return stft_tensor
 
+
+def _gcc_cfg(cfg, key, default):
+    """Read cfg.gcc.<key> with a default, tolerant of missing gcc block."""
+    sub = getattr(cfg, "gcc", None)
+    if sub is None:
+        return default
+    return getattr(sub, key, default)
+
+
+def gcc_phat_frames(wav, cfg, n_lags=None, eps: float = 1e-10):
+    """Framed PHAT-weighted GCC cross-correlation for every microphone pair.
+
+    Mirrors the framing used by the STFT/RTF front-end (frame = ``cfg.nfft``,
+    hop = ``nfft * (1 - overlap)``) so the GCC frame grid lines up with the RTF
+    one and the cached samples pad/truncate identically. Each pair's
+    cross-correlation is PHAT-whitened, centred on zero lag and cropped to a
+    small ``±n_lags//2`` window — the physically plausible TDOA range — which
+    keeps the feature tiny (see ``data/build_gcc_cache_splits.py``).
+
+    Args:
+        wav: ``[C, T]`` waveform (tensor or ndarray) sampled at ``cfg.fs``.
+        cfg: needs ``nfft`` and ``overlap``; ``cfg.gcc.n_lags`` overrides ``n_lags``.
+
+    Returns:
+        ``[P, T_frames, n_lags]`` float tensor, ``P = C*(C-1)/2`` mic pairs.
+    """
+    if not torch.is_tensor(wav):
+        wav = torch.as_tensor(wav)
+    wav = wav.float()
+    C, T = wav.shape
+    n_fft = int(cfg.nfft)
+    frame_len = n_fft
+    hop = max(1, int(n_fft * (1 - cfg.overlap)))
+    if n_lags is None:
+        n_lags = int(_gcc_cfg(cfg, "n_lags", 41))
+    n_lags = int(n_lags) | 1                      # force odd so it is centred
+    half = n_lags // 2
+
+    n_frames = 1 if T < frame_len else 1 + (T - frame_len) // hop
+    window = torch.hamming_window(frame_len, periodic=True, dtype=wav.dtype)
+
+    frames = wav.new_zeros((n_frames, C, frame_len))
+    for k in range(n_frames):
+        s = k * hop
+        seg = wav[:, s:s + frame_len]
+        frames[k, :, : seg.shape[1]] = seg
+    frames = frames * window
+
+    X = torch.fft.rfft(frames, n=n_fft, dim=-1)            # [n_frames, C, K]
+    i_idx = [i for i in range(C) for j in range(i + 1, C)]
+    j_idx = [j for i in range(C) for j in range(i + 1, C)]
+    P = X[:, i_idx] * X[:, j_idx].conj()                   # [n_frames, P, K]
+    P = P / (P.abs() + eps)                                # PHAT weighting
+    cc = torch.fft.irfft(P, n=n_fft, dim=-1)               # [n_frames, P, n_fft]
+    cc = torch.fft.fftshift(cc, dim=-1)
+    center = n_fft // 2
+    cc = cc[..., center - half: center + half + 1]         # [n_frames, P, n_lags]
+    return cc.permute(1, 0, 2).contiguous()                # [P, T, n_lags]
+
+
+def subsample_peak(y, method: str = "parabolic", os: int = 8, radius: int = 4):
+    """Locate the peak of ``y`` along its last axis with sub-sample accuracy.
+
+    Returns the (fractional) peak position in samples, shaped ``y.shape[:-1]``.
+    ``method='parabolic'`` fits a 3-point parabola through the argmax and its
+    neighbours (the formula used by the synthetic generator); ``method='sinc'``
+    band-limited-interpolates a small window around the peak and re-argmaxes on
+    an ``os``×-finer grid. Offsets are forced to 0 at the array boundaries.
+    """
+    L = y.shape[-1]
+    idx = y.argmax(dim=-1)                                  # [...]
+    on_edge = (idx <= 0) | (idx >= L - 1)
+
+    if method == "sinc":
+        offs = torch.arange(-radius, radius + 1, device=y.device)
+        fracs = torch.linspace(-1.0, 1.0, 2 * os + 1, device=y.device, dtype=y.dtype)
+        win_idx = (idx.unsqueeze(-1) + offs).clamp(0, L - 1)        # [..., W]
+        win_vals = y.gather(-1, win_idx)                           # [..., W]
+        kernel = torch.sinc(fracs.unsqueeze(-1) - offs.to(y.dtype)) # [G, W]
+        interp = (win_vals.unsqueeze(-2) * kernel).sum(dim=-1)     # [..., G]
+        delta = fracs[interp.argmax(dim=-1)]                       # [...]
+    else:
+        idxm = (idx - 1).clamp(0, L - 1)
+        idxp = (idx + 1).clamp(0, L - 1)
+        y0 = y.gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+        ym = y.gather(-1, idxm.unsqueeze(-1)).squeeze(-1)
+        yp = y.gather(-1, idxp.unsqueeze(-1)).squeeze(-1)
+        denom = ym - 2.0 * y0 + yp
+        delta = torch.where(
+            denom.abs() > 1e-12,
+            0.5 * (ym - yp) / denom,
+            torch.zeros_like(denom),
+        ).clamp(-1.0, 1.0)
+
+    delta = torch.where(on_edge, torch.zeros_like(delta), delta)
+    return idx.to(y.dtype) + delta
+
+
+def _torch_unwrap(p, dim: int = 1):
+    """NumPy-style phase unwrap along ``dim`` for a torch tensor."""
+    dp = torch.diff(p, dim=dim)
+    dp_mod = (dp + torch.pi) % (2 * torch.pi) - torch.pi
+    dp_mod = torch.where((dp_mod == -torch.pi) & (dp > 0),
+                         torch.full_like(dp_mod, torch.pi), dp_mod)
+    corr = torch.cumsum(dp_mod - dp, dim=dim)
+    zeros = torch.zeros_like(p.narrow(dim, 0, 1))
+    return p + torch.cat([zeros, corr], dim=dim)
+
+
+def median_smooth_doa(doa_vec, win: int = 5):
+    """Sliding-window median smooth of a unit-vector DOA track ``[B, T, 2]``.
+
+    Medians the (cos, sin) components independently then renormalises — robust
+    to outlier frames and wrap-safe (no angle arithmetic). ``win`` is forced odd.
+    """
+    if win is None or int(win) <= 1:
+        return doa_vec
+    win = int(win) | 1
+    pad = win // 2
+    x = doa_vec.transpose(1, 2)                              # [B, 2, T]
+    xp = F.pad(x, (pad, pad), mode="replicate")
+    wins = xp.unfold(-1, win, 1)                             # [B, 2, T, win]
+    med = wins.median(dim=-1).values.transpose(1, 2)        # [B, T, 2]
+    return F.normalize(med, dim=-1)
+
+
+def kalman_smooth_doa(doa_vec, q: float = 1e-3, r: float = 5e-2):
+    """Constant-velocity Kalman smooth of a unit-vector DOA track ``[B, T, 2]``.
+
+    Tracks the azimuth (wrap-unwrapped along time) with a 2-state [angle, rate]
+    filter; ``q`` is the process-noise scale and ``r`` the measurement variance.
+    Returns the filtered track re-emitted as unit vectors.
+    """
+    B, T, _ = doa_vec.shape
+    device = doa_vec.device
+    ang = torch.atan2(doa_vec[..., 1], doa_vec[..., 0])      # [B, T]
+    # The scalar KF is a tight sequential loop — run it on CPU then move back.
+    ang_u = _torch_unwrap(ang, dim=1).float().cpu()
+    out = torch.empty_like(ang_u)
+
+    Fm = torch.tensor([[1.0, 1.0], [0.0, 1.0]])
+    H = torch.tensor([[1.0, 0.0]])
+    Q = q * torch.eye(2)
+    R = torch.tensor([[float(r)]])
+    I2 = torch.eye(2)
+    for b in range(B):
+        x = torch.stack([ang_u[b, 0], torch.zeros((), dtype=ang_u.dtype)])
+        Pm = torch.eye(2)
+        for t in range(T):
+            x = Fm @ x
+            Pm = Fm @ Pm @ Fm.T + Q
+            innov = ang_u[b, t] - (H @ x)[0]
+            S = (H @ Pm @ H.T + R)[0, 0]
+            K = (Pm @ H.T)[:, 0] / S
+            x = x + K * innov
+            Pm = (I2 - torch.outer(K, H[0])) @ Pm
+            out[b, t] = x[0]
+    ang_s = torch.remainder(out + torch.pi, 2 * torch.pi) - torch.pi
+    smoothed = torch.stack((ang_s.cos(), ang_s.sin()), dim=-1)
+    return smoothed.to(device=device, dtype=doa_vec.dtype)
+
+
 def compute_multichannel_istft(signal: np.ndarray, cfg):
     T, _, M = signal.shape
     signal_tensor = torch.from_numpy(signal).float()
